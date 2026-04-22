@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew.bat :composeApp:compileKotlinJvm --console=plain --no-daemon)",
+      "Bash(./gradlew.bat :composeApp:compileKotlinJvm --console=plain)",
+      "Bash(./gradlew.bat --stop)"
+    ]
+  }
+}
