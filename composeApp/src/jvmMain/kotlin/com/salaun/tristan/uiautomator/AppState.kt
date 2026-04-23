@@ -10,15 +10,22 @@ import androidx.compose.runtime.mutableStateSetOf
 import com.salaun.tristan.uiautomator.adb.AdbDevice
 import com.salaun.tristan.uiautomator.adb.AdbError
 import com.salaun.tristan.uiautomator.adb.AdbService
+import com.salaun.tristan.uiautomator.explorer.ExplorationConfig
+import com.salaun.tristan.uiautomator.explorer.ExplorationSession
+import com.salaun.tristan.uiautomator.explorer.Explorer
+import com.salaun.tristan.uiautomator.explorer.ExplorerProgress
+import com.salaun.tristan.uiautomator.explorer.SessionStore
 import com.salaun.tristan.uiautomator.model.DumpParser
 import com.salaun.tristan.uiautomator.model.UiNode
 import com.salaun.tristan.uiautomator.settings.AppSettings
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-enum class Screen { Main, Settings }
+enum class Screen { Main, Settings, Explorer, Graph }
 
 class AppState(
     val settings: AppSettings,
@@ -42,6 +49,17 @@ class AppState(
     var rootNode: UiNode? by mutableStateOf(null)
     val expanded: SnapshotStateSet<UiNode> = mutableStateSetOf()
     var selectedNode: UiNode? by mutableStateOf(null)
+
+    // Exploration
+    var explorerConfig: ExplorationConfig by mutableStateOf(
+        ExplorationConfig(targetPackage = "")
+    )
+    var explorerRunning: Boolean by mutableStateOf(false)
+    private var explorerJob: Job? = null
+    val explorerLog: SnapshotStateList<String> = mutableStateListOf()
+    var explorerProgress: ExplorerProgress? by mutableStateOf(null)
+    var explorerSession: ExplorationSession? by mutableStateOf(null)
+    var explorerStore: SessionStore? by mutableStateOf(null)
 
     fun initialize() {
         if (adbPath.isBlank()) {
@@ -166,4 +184,77 @@ class AppState(
             while (p != null) { expanded += p; p = p.parent }
         }
     }
+
+    fun suggestTargetPackage(): String {
+        val hint = rootNode?.let {
+            val counts = HashMap<String, Int>()
+            it.walk { n -> if (n.packageName.isNotBlank()) counts.merge(n.packageName, 1, Int::plus) }
+            counts.entries.maxByOrNull { it.value }?.key
+        }
+        return hint.orEmpty()
+    }
+
+    fun updateExplorerConfig(update: ExplorationConfig.() -> ExplorationConfig) {
+        explorerConfig = explorerConfig.update()
+    }
+
+    fun startExploration() {
+        if (explorerRunning) return
+        if (adbPath.isBlank()) { errorMessage = "Configurez ADB d'abord."; return }
+        val pkg = explorerConfig.targetPackage.trim()
+        if (pkg.isBlank()) { errorMessage = "Indiquez un package cible."; return }
+        val serial = selectedSerial
+        val store = SessionStore.create(SessionStore.defaultRoot(), pkg)
+        val explorer = Explorer(adb, serial, explorerConfig, store)
+        explorerLog.clear()
+        explorerProgress = null
+        explorerSession = null
+        explorerStore = store
+        errorMessage = null
+        explorerRunning = true
+
+        explorerJob = scope.launch {
+            try {
+                val listener = object : Explorer.Listener {
+                    override fun onLog(msg: String) {
+                        explorerLog += msg
+                        if (explorerLog.size > 500) explorerLog.removeAt(0)
+                    }
+                    override fun onProgress(progress: ExplorerProgress) {
+                        explorerProgress = progress
+                    }
+                    override fun onSessionUpdated(session: ExplorationSession) {
+                        explorerSession = session
+                    }
+                }
+                val session = withContext(Dispatchers.IO) { explorer.run(listener) }
+                explorerSession = session
+            } catch (_: CancellationException) {
+                explorerLog += "Exploration annulée."
+            } catch (e: Exception) {
+                errorMessage = "Exploration : ${e.message ?: e::class.simpleName}"
+            } finally {
+                explorerRunning = false
+            }
+        }
+    }
+
+    fun stopExploration() {
+        explorerJob?.cancel()
+    }
+
+    fun openGraphForCurrentSession() {
+        if (explorerSession != null) screen = Screen.Graph
+    }
+
+    fun loadSessionFromDir(dir: java.io.File) {
+        val loaded = SessionStore.load(dir) ?: run {
+            errorMessage = "Session illisible : ${dir.absolutePath}"
+            return
+        }
+        explorerSession = loaded
+        explorerStore = SessionStore(dir)
+        screen = Screen.Graph
+    }
+
 }

@@ -96,6 +96,14 @@ private fun Toolbar(state: AppState) {
             }
         }
 
+        TextButton(onClick = { state.screen = Screen.Explorer }) {
+            Text("Explorer")
+        }
+        if (state.explorerSession != null) {
+            TextButton(onClick = { state.screen = Screen.Graph }) {
+                Text("Graphe")
+            }
+        }
         TextButton(onClick = { state.screen = Screen.Settings }) {
             Text("Paramètres")
         }

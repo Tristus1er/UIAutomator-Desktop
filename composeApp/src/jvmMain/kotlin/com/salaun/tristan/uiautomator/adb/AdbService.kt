@@ -100,6 +100,40 @@ class AdbService(@Volatile var adbPath: String) {
         r.stdout
     }
 
+    suspend fun inputTap(serial: String?, x: Int, y: Int) = withContext(Dispatchers.IO) {
+        val r = run(listOf("shell", "input", "tap", x.toString(), y.toString()), timeoutMs = 5_000, serial = serial)
+        if (r.exitCode != 0) throw AdbError("input tap failed: ${r.stderr.ifBlank { "exit=${r.exitCode}" }}")
+    }
+
+    suspend fun pressBack(serial: String?) = withContext(Dispatchers.IO) {
+        val r = run(listOf("shell", "input", "keyevent", "KEYCODE_BACK"), timeoutMs = 5_000, serial = serial)
+        if (r.exitCode != 0) throw AdbError("keyevent BACK failed: ${r.stderr.ifBlank { "exit=${r.exitCode}" }}")
+    }
+
+    suspend fun pressHome(serial: String?) = withContext(Dispatchers.IO) {
+        run(listOf("shell", "input", "keyevent", "KEYCODE_HOME"), timeoutMs = 5_000, serial = serial)
+    }
+
+    suspend fun launchApp(serial: String?, pkg: String) = withContext(Dispatchers.IO) {
+        val r = run(
+            listOf("shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"),
+            timeoutMs = 10_000, serial = serial,
+        )
+        val text = r.stdoutText + "\n" + r.stderr
+        if (r.exitCode != 0 || text.contains("monkey aborted") || text.contains("No activities found")) {
+            throw AdbError("launch $pkg failed: ${text.trim().take(200)}")
+        }
+    }
+
+    suspend fun topPackage(serial: String?): String? = withContext(Dispatchers.IO) {
+        val r = run(listOf("shell", "dumpsys", "activity", "activities"), timeoutMs = 5_000, serial = serial)
+        if (r.exitCode != 0) return@withContext null
+        Regex("""mResumedActivity.*?\{[^}]*?([\w.]+)/[\w.\$]+""")
+            .find(r.stdoutText)?.groupValues?.getOrNull(1)
+            ?: Regex("""topResumedActivity.*?\{[^}]*?([\w.]+)/[\w.\$]+""")
+                .find(r.stdoutText)?.groupValues?.getOrNull(1)
+    }
+
     suspend fun dumpUiXml(serial: String?): String = withContext(Dispatchers.IO) {
         val remote = "/sdcard/window_dump.xml"
         val dump = run(listOf("shell", "uiautomator", "dump", remote), timeoutMs = 20_000, serial = serial)

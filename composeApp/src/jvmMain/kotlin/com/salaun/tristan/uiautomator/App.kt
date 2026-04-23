@@ -11,6 +11,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import com.salaun.tristan.uiautomator.settings.AppSettings
+import com.salaun.tristan.uiautomator.ui.ExplorerScreen
+import com.salaun.tristan.uiautomator.ui.GraphScreen
 import com.salaun.tristan.uiautomator.ui.MainScreen
 import com.salaun.tristan.uiautomator.ui.SettingsScreen
 
@@ -29,6 +31,8 @@ fun App() {
                 when (state.screen) {
                     Screen.Main -> MainScreen(state)
                     Screen.Settings -> SettingsScreen(state)
+                    Screen.Explorer -> ExplorerScreen(state)
+                    Screen.Graph -> GraphScreen(state)
                 }
             }
         }
