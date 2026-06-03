@@ -96,6 +96,20 @@ class StateOpsTest {
     }
 
     @Test
+    fun `collectClickables treats a list as a single candidate by default`() {
+        // By default a list / grid / picker counts as ONE candidate to click:
+        // every cell leads to the same kind of screen, so clicking more than
+        // one only inflates the crawl with near-duplicate states.
+        val root = parse("hour_picker.xml")
+        val actions = StateOps.collectClickables(root, pkgFilter = "com.example.app", max = 100)
+        val cells = actions.filter { it.resourceId.endsWith("/hour_cell") }
+        assertEquals(1, cells.size, "a list must count as a single click candidate by default")
+        assertEquals(24, cells.single().siblingGroupSize, "the kept rep must remember the original group size")
+        // A standalone button is not part of any group → it still comes through.
+        assertTrue(actions.any { it.resourceId.endsWith("/done") })
+    }
+
+    @Test
     fun `structureFingerprint is invariant when only labelled text changes`() {
         // The two hour-picker dumps have identical DOM but different title
         // text. The strict fingerprint shifts (text on resource-id'd nodes
@@ -134,7 +148,9 @@ class StateOpsTest {
     @Test
     fun `wheelPickerAncestor walks up to a NumberPicker container`() {
         val root = parse("number_picker.xml")
-        val cells = StateOps.collectClickables(root, pkgFilter = "com.example.app", max = 100)
+        // This test is about the wheel-picker *flagging*, not the sibling cap:
+        // keep every cell (cap high) so we can assert all six are flagged.
+        val cells = StateOps.collectClickables(root, pkgFilter = "com.example.app", max = 100, maxPerSiblingGroup = 100)
         // Six picker cells (3 hour + 3 minute) plus the Validate button.
         val pickerCells = cells.filter { it.insideWheelPicker }
         val nonPickerCells = cells.filterNot { it.insideWheelPicker }

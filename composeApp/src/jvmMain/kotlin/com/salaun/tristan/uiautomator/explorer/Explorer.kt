@@ -545,6 +545,31 @@ class Explorer(
     }.getOrNull()
 
     /**
+     * Recovers after a tap pushed us *outside* the target app. The external
+     * screen has already been captured as a terminal state; now we get back in.
+     * We press BACK up to [BACK_RECOVERY_ATTEMPTS] times — some external screens
+     * (a browser, a file picker) are several activities deep — and the moment a
+     * BACK lands on a known in-app screen we resume from there. If we still
+     * can't find our way back into the app, it is force-stopped and relaunched
+     * (kill + restart) and we re-attach to the root, so the crawl never stalls
+     * on a foreign screen.
+     */
+    private suspend fun returnToApp(fallback: StateEntry): StateEntry {
+        repeat(BACK_RECOVERY_ATTEMPTS) {
+            runCatching { adb.pressBack(serial) }
+            delay(config.settleDelayMs)
+            val snap = runCatching { capture() }.getOrNull() ?: return@repeat
+            // Still on a foreign screen — press BACK again.
+            if (config.targetPackage.isNotBlank() && snap.pkg != config.targetPackage) return@repeat
+            val known = fingerprintToId[snap.fingerprint]
+                ?.let { id -> session.states.firstOrNull { it.id == id } }
+            if (known != null) return known
+        }
+        listener.onLog("  ↻ couldn't return to ${config.targetPackage} — kill + relaunch")
+        return relaunchToRoot() ?: fallback
+    }
+
+    /**
      * Taps a single [click] on [source] and returns the state the device ends
      * up on afterwards (which may be [source] itself for a self-loop, a fresh
      * child, or a previously-known screen we are now physically on). Returns
@@ -593,10 +618,10 @@ class Explorer(
             countProcessed(source.id, click.label); persist()
             if (grant == null) {
                 listener.onLog("  ⚠ permission dialog unresolved on ${after.pkg}")
-                return reanchor() ?: source
+                return reanchor() ?: returnToApp(source)
             }
             listener.onLog("  🔓 auto-granted permission(s) → behind ${grant.behind.pkg}")
-            return classifyBehindPermission(source, click, grant) ?: reanchor() ?: source
+            return classifyBehindPermission(source, click, grant) ?: reanchor() ?: returnToApp(source)
         }
 
         // Left the target app (e.g. a tap opened a web page in the browser).
@@ -612,13 +637,11 @@ class Explorer(
                 registerExternalState(after, source.pathFromRoot + click)
                     .also { fingerprintToId[after.fingerprint] = it.id }.id
             }
-            listener.onLog("  ⇗ left app (${after.pkg}) → captured as $externalId, BACK")
+            listener.onLog("  ⇗ left app (${after.pkg}) → captured as $externalId")
             session.transitions += TransitionEntry(source.id, externalId, click, leftApp = true)
             backLeadsTo[externalId] = source.id
             countProcessed(source.id, click.label); persist()
-            runCatching { adb.pressBack(serial) }
-            delay(config.settleDelayMs)
-            return reanchor() ?: source
+            return returnToApp(source)
         }
 
         val knownId = fingerprintToId[after.fingerprint]
@@ -768,16 +791,26 @@ class Explorer(
      * trigger-only path, or an already-known screen), or `null` when the grant
      * left us off-app — so the frontier loop keeps diving from the right place.
      */
-    private fun classifyBehindPermission(
+    private suspend fun classifyBehindPermission(
         source: StateEntry,
         click: ClickableRef,
         grant: GrantOutcome,
     ): StateEntry? {
         val behind = grant.behind
         if (config.targetPackage.isNotBlank() && behind.pkg != config.targetPackage) {
-            listener.onLog("  ⇗ behind permission still off-app (${behind.pkg})")
-            session.transitions += TransitionEntry(grant.lastDialogId, null, grant.lastAllowAction, leftApp = true)
-            return null
+            // Granting the permission bounced us out of the app (e.g. it fired a
+            // call / share intent that opened the dialer). Capture that external
+            // screen as a terminal state so the edge points at a real screenshot
+            // instead of a dangling dead-end, then climb back into the app rather
+            // than carrying on while physically stranded on a foreign screen.
+            val knownExt = fingerprintToId[behind.fingerprint]
+            val externalId = knownExt
+                ?: registerExternalState(behind, source.pathFromRoot + click)
+                    .also { fingerprintToId[behind.fingerprint] = it.id }.id
+            listener.onLog("  ⇗ behind permission left the app (${behind.pkg}) → captured as $externalId")
+            session.transitions += TransitionEntry(grant.lastDialogId, externalId, grant.lastAllowAction, leftApp = true)
+            backLeadsTo[externalId] = source.id
+            return returnToApp(source)
         }
         val knownId = fingerprintToId[behind.fingerprint]
         if (knownId != null) {

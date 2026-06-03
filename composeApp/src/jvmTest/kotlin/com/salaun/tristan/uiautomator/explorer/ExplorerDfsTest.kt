@@ -581,6 +581,57 @@ class ExplorerDfsTest {
     }
 
     @Test
+    fun `a grant that bounces out of the app captures the external screen and returns, never dead-ends`() {
+        // Regression: tapping a button mounted a permission dialog whose grant
+        // fired a phone intent — landing the device on the system dialer
+        // (com.android.server.telecom), OUTSIDE the app. The old code recorded a
+        // dangling `dialog → null` leftApp edge and then returned the *source*
+        // while physically stranded on the dialer, so the crawl kept tapping the
+        // wrong screen. Now the foreign screen must be captured as a terminal
+        // external state (real edge) and the explorer must climb back into the app.
+        val homeXml = screen("home", listOf(Btn("request_perm", 100, 100)))
+        val telecomXml = screen("dialer").replace(pkg, "com.android.server.telecom")
+        val permissionDialogXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.android.permissioncontroller" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="1" text="Allow" class="android.widget.Button" resource-id="com.android.permissioncontroller:id/permission_allow_button" package="com.android.permissioncontroller" clickable="true" enabled="true" bounds="[120,1700][960,1800]"/>
+    <node index="2" text="Don't allow" class="android.widget.Button" resource-id="com.android.permissioncontroller:id/permission_deny_button" package="com.android.permissioncontroller" clickable="true" enabled="true" bounds="[120,1940][960,2040]"/>
+  </node>
+</hierarchy>"""
+
+        val fake = FakeAdbGateway(
+            screens = mapOf(
+                "home" to FakeAdbGateway.Screen(homeXml),
+                "permission_dialog" to FakeAdbGateway.Screen(permissionDialogXml),
+                "telecom" to FakeAdbGateway.Screen(telecomXml),
+            ),
+            tapTable = mapOf(
+                FakeAdbGateway.TapKey("home", 100, 100) to "permission_dialog",
+                FakeAdbGateway.TapKey("permission_dialog", 540, 1750) to "telecom", // Allow → leaves to dialer
+            ),
+            launchTarget = "home",
+        )
+
+        val session = runExplorer(fake)
+
+        val dialog = session.states.single { it.packageName == "com.android.permissioncontroller" }
+        assertTrue(dialog.clickables.isEmpty(), "the captured dialog stays terminal")
+        // The foreign dialer is captured as a real external state…
+        val telecom = session.states.single { it.packageName == "com.android.server.telecom" }
+        assertTrue(telecom.clickables.isEmpty(), "an external screen is terminal — never explored")
+        // …reached by a real leftApp edge from the dialog, NOT a dangling dead-end.
+        val grant = session.transitions.single { it.leftApp }
+        assertEquals(dialog.id, grant.from)
+        assertEquals(telecom.id, grant.to, "the grant edge must point at the captured external screen")
+        assertTrue(
+            session.transitions.none { it.leftApp && it.to == null },
+            "no dangling leftApp dead-end may remain",
+        )
+        // The explorer climbed back into the app (it ended on a known in-app screen).
+        assertTrue(session.states.first().packageName == pkg)
+    }
+
+    @Test
     fun `permission flow bouncing through Settings is backed out to the app`() {
         // Some apps (Laqi does this for location) deep-link the permission
         // request through the system Settings app: the runtime dialog appears
@@ -815,6 +866,48 @@ class ExplorerDfsTest {
         }
         assertEquals(3, session.states.size, "home + pageA + pageB")
         assertEquals(1, gw.launches, "multi-BACK recovery must avoid relaunching the app")
+    }
+
+    @Test
+    fun `leaving the app and being unable to BACK in triggers a kill and relaunch`() {
+        // A tap opens a foreign screen that swallows BACK (a browser / external
+        // app that ignores it). After a few fruitless BACKs the explorer must
+        // force-stop and relaunch the target app, then carry on with the rest.
+        val homeXml = screen("home", listOf(Btn("ext", 100, 100), Btn("safe", 100, 200)))
+        val extXml = screen("ext").replace(pkg, "com.android.chrome")
+        val gw = object : com.salaun.tristan.uiautomator.adb.AdbGateway {
+            val xml = mapOf("home" to homeXml, "ext" to extXml, "safe_page" to screen("safe_page"))
+            var screen = "home"
+            var launches = 0
+            override suspend fun launchApp(serial: String?, pkg: String) { screen = "home"; launches++ }
+            override suspend fun pressBack(serial: String?) {
+                // "ext" is a foreign app that ignores BACK; in-app pages go home.
+                screen = if (screen == "safe_page") "home" else screen
+            }
+            override suspend fun inputTap(serial: String?, x: Int, y: Int) {
+                if (screen == "home") screen = if (y < 150) "ext" else "safe_page"
+            }
+            override suspend fun inputSwipe(serial: String?, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int) {}
+            override suspend fun screenshotPng(serial: String?): ByteArray = byteArrayOf(1)
+            override suspend fun dumpUiXml(serial: String?): String = xml.getValue(screen)
+        }
+        val session = runBlocking {
+            val store = SessionStore(tmp.newFolder("session"))
+            val config = ExplorationConfig(targetPackage = pkg, settleDelayMs = 0)
+            Explorer(gw, serial = null, config = config, store = store).run(SilentListener)
+        }
+
+        // The foreign screen was captured as a terminal external state…
+        val leftApp = session.transitions.single { it.leftApp }
+        val external = session.states.single { it.id == leftApp.to }
+        assertEquals("com.android.chrome", external.packageName)
+        // …being trapped outside forced a kill + relaunch (initial + ≥1 relaunch)…
+        assertTrue(gw.launches >= 2, "being trapped outside the app must trigger a kill + relaunch, got ${gw.launches}")
+        // …and the crawl carried on to the other button afterwards.
+        assertTrue(
+            session.transitions.any { !it.leftApp && it.action.resourceId.endsWith("/safe") && it.to != null },
+            "exploration must continue after the relaunch",
+        )
     }
 
     @Test

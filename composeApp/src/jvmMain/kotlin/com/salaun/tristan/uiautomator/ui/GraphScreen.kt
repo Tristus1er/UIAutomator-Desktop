@@ -385,6 +385,26 @@ private fun GraphCanvas(
     val multiSelection: SnapshotStateSet<String> = remember(session.id) {
         mutableStateSetOf<String>().apply { selectedId?.let { add(it) } }
     }
+    // The most recent selection this canvas itself drove (card click / context
+    // menu). We compare against it so that when [selectedId] changes from the
+    // OUTSIDE — the details panel's "Open State" button or an outgoing-transition
+    // row — we know to reset the visual selection set onto that card. Card clicks
+    // route through [selectInternal], which keeps this in step so Shift/Ctrl
+    // multi-selection is never clobbered by the sync effect below.
+    var lastInternalSelection: String? by remember(session.id) { mutableStateOf(selectedId) }
+    val selectInternal: (String) -> Unit = { id ->
+        lastInternalSelection = id
+        onSelect(id)
+    }
+    LaunchedEffect(selectedId) {
+        if (selectedId != lastInternalSelection) {
+            // Selection arrived from outside the canvas → make that card THE
+            // selection so its border lights up exactly as a direct click would.
+            multiSelection.clear()
+            selectedId?.let { multiSelection += it }
+            lastInternalSelection = selectedId
+        }
+    }
     // Marquee rectangle being drawn while the user Shift-drags on the
     // background. Coordinates are in unscaled inner-content dp, so the
     // overlay aligns with the card layout regardless of the current zoom.
@@ -868,7 +888,7 @@ private fun GraphCanvas(
                                         if (stateEntry.id !in multiSelection) {
                                             multiSelection.clear()
                                             multiSelection += stateEntry.id
-                                            onSelect(stateEntry.id)
+                                            selectInternal(stateEntry.id)
                                         }
                                         val sel = multiSelection.size
                                         buildList {
@@ -912,7 +932,7 @@ private fun GraphCanvas(
                                                         // post-merge reality.
                                                         multiSelection.clear()
                                                         multiSelection += primaryId
-                                                        onSelect(primaryId)
+                                                        selectInternal(primaryId)
                                                         onRequestMerge(merged)
                                                     })
                                                 }
@@ -981,7 +1001,7 @@ private fun GraphCanvas(
                                             multiSelection += stateEntry.id
                                         }
                                     }
-                                    onSelect(stateEntry.id)
+                                    selectInternal(stateEntry.id)
                                 },
                                 onDrag = { dragPx ->
                                     // Group-drag: when the dragged card is in the
@@ -1335,11 +1355,27 @@ private fun EdgeCanvas(
             // begins. The tip of the triangle stays anchored to the card,
             // giving a clean "line → triangle → card" silhouette.
             val arrowLen = ARROW_LEN
+            // Where the curve meets a card its tangent is axis-aligned — the
+            // control points below keep it horizontal for a HORIZONTAL edge and
+            // vertical for a VERTICAL one. The arrowhead must follow THAT tangent,
+            // not the straight start→end chord: on a Bézier curve the chord runs
+            // diagonally while the line actually arrives square to the border, so
+            // a chord-oriented triangle looks visibly skewed. These approach
+            // points encode the tangent direction at each endpoint and drive both
+            // the curve-shrink and the arrowhead orientation.
+            val endApproach = when (orientation) {
+                EdgeOrientation.HORIZONTAL -> Offset(start.x, end.y)
+                EdgeOrientation.VERTICAL -> Offset(end.x, start.y)
+            }
+            val startApproach = when (orientation) {
+                EdgeOrientation.HORIZONTAL -> Offset(end.x, start.y)
+                EdgeOrientation.VERTICAL -> Offset(start.x, end.y)
+            }
             val curveEnd = if (t.to != null) {
-                shrinkToward(end, start, arrowLen)
+                shrinkToward(end, endApproach, arrowLen)
             } else end
             val curveStart = if (isBidirectional) {
-                shrinkToward(start, end, arrowLen)
+                shrinkToward(start, startApproach, arrowLen)
             } else start
             val path = Path().apply {
                 moveTo(curveStart.x, curveStart.y)
@@ -1372,14 +1408,14 @@ private fun EdgeCanvas(
             }
             drawPath(path, color = color, style = Stroke(width = strokeWidth))
             if (t.to != null) {
-                // Arrowhead at the destination, oriented along the curve's
-                // tangent at the endpoint (i.e. pointing back toward source).
-                drawPath(arrowheadAt(tip = end, awayFrom = start, length = arrowLen), color = color)
+                // Arrowhead at the destination, following the curve's tangent
+                // (axis-aligned) where it meets the card — see endApproach above.
+                drawPath(arrowheadAt(tip = end, awayFrom = endApproach, length = arrowLen), color = color)
                 if (isBidirectional) {
                     // Mirror arrowhead at the source so the pair reads as
                     // "↔" — the user instantly recognises a round-trip
                     // without following each direction separately.
-                    drawPath(arrowheadAt(tip = start, awayFrom = end, length = arrowLen), color = color)
+                    drawPath(arrowheadAt(tip = start, awayFrom = startApproach, length = arrowLen), color = color)
                 }
             }
         }

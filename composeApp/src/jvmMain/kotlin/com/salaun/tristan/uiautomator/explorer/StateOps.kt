@@ -369,19 +369,20 @@ object StateOps {
      * registrations because each cell tap shifts the fingerprint a tiny bit.
      *
      * We group clickables by `(parent, className, resourceId)` and keep at
-     * most [maxPerSiblingGroup] representatives per group, evenly spread so
-     * the first / middle / last cells are still probed (gives signal that any
-     * cell of the picker behaves the same way). The actual number of siblings
-     * in the original group is recorded on each kept [ClickableRef] as
-     * `siblingGroupSize`, so the explorer can later tell that a tap on a cell
-     * comes from a "picker-like" group and decide that an apparently-new
-     * destination state with the same structure is in fact the same screen.
+     * most [maxPerSiblingGroup] representatives per group. The default is **1**:
+     * a list / grid / picker counts as a *single* candidate to click, because
+     * every cell of such a group leads to the same kind of screen — clicking
+     * more than one only inflates the crawl with near-duplicate states. The
+     * actual number of siblings in the original group is still recorded on the
+     * kept [ClickableRef] as `siblingGroupSize`, so the explorer can later tell
+     * that a tap came from a "picker-like" group and decide that an
+     * apparently-new destination with the same structure is the same screen.
      */
     fun collectClickables(
         root: UiNode,
         pkgFilter: String,
         max: Int,
-        maxPerSiblingGroup: Int = 3,
+        maxPerSiblingGroup: Int = 1,
     ): List<ClickableRef> {
         data class Candidate(val node: UiNode, val ref: ClickableRef)
         val seen = HashSet<String>()
