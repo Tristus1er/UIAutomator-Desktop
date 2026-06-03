@@ -9,6 +9,7 @@ import com.salaun.tristan.uiautomator.explorer.StateEntry
 import com.salaun.tristan.uiautomator.explorer.TransitionEntry
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -78,24 +79,49 @@ class GraphAutoLayoutTest {
     }
 
     @Test
-    fun `a long linear chain is folded into a compact block, not a single row`() {
+    fun `a linear chain reads left-to-right, S0 leftmost, without overlap`() {
         val nodes = (0..15).map { state("N$it") }
         val chain = (0 until 15).map { edge("N$it", "N${it + 1}") }
         val pos = layout(nodes, chain)
 
         assertNoOverlap(pos)
-        val minX = pos.values.minOf { it.x }; val maxX = pos.values.maxOf { it.x }
-        val minY = pos.values.minOf { it.y }; val maxY = pos.values.maxOf { it.y }
-        // A single horizontal row would span 15*colStep wide and 0 tall. The
-        // folded layout must be far narrower AND have real vertical extent.
-        assertTrue(
-            (maxX - minX) < 15 * colStep * 0.6f,
-            "chain must be folded, width=${maxX - minX} vs single-row ${15 * colStep}",
+        // Each step advances exactly one column to the right — a clean flow.
+        for (i in 0 until 15) {
+            assertTrue(
+                pos["N${i + 1}"]!!.x > pos["N$i"]!!.x,
+                "N${i + 1} must sit to the right of N$i",
+            )
+        }
+        assertEquals(pos["N0"]!!.x, pos.values.minOf { it.x }, "N0 (entry) is the leftmost tile")
+    }
+
+    @Test
+    fun `a tree is drawn without any edge crossings`() {
+        // A small two-level tree. The barycenter ordering must place it so no
+        // two parent→child arrows cross.
+        val nodes = (0..6).map { state("S$it") }
+        val edges = listOf(
+            "S0" to "S1", "S0" to "S2",
+            "S1" to "S3", "S1" to "S4",
+            "S2" to "S5", "S2" to "S6",
         )
-        assertTrue(
-            (maxY - minY) >= rowStep,
-            "folded chain must occupy more than one row, height=${maxY - minY}",
-        )
+        val pos = layout(nodes, edges.map { edge(it.first, it.second) })
+        assertEquals(0, forwardCrossings(pos, edges), "a tree must lay out crossing-free")
+    }
+
+    /** Counts crossings between pairs of adjacent-layer edges from their tile positions. */
+    private fun forwardCrossings(pos: Map<String, Offset>, edges: List<Pair<String, String>>): Int {
+        fun col(id: String) = ((pos[id]!!.x - margin) / colStep).roundToInt()
+        fun row(id: String) = (pos[id]!!.y - margin) / rowStep
+        var crossings = 0
+        for (i in edges.indices) for (j in i + 1 until edges.size) {
+            val (u1, v1) = edges[i]
+            val (u2, v2) = edges[j]
+            if (col(u1) == col(u2) && col(v1) == col(v2) && col(v1) == col(u1) + 1) {
+                if ((row(u1) - row(u2)) * (row(v1) - row(v2)) < 0f) crossings++
+            }
+        }
+        return crossings
     }
 
     @Test
