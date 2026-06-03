@@ -76,6 +76,20 @@ suspend fun waitForScreenIdle(
     return ScreenIdleResult(png = lastPng, stable = false, screenshotsTaken = screenshots)
 }
 
+/**
+ * `true` when two screenshots differ by more than [tolerance] of their sampled
+ * pixels — i.e. the screen is actively animating between [a] and [b]. Used to
+ * recognise a Compose "wait" screen (a Connecting / loading / updating screen
+ * whose caption and spinner are drawn but absent from the accessibility tree)
+ * by its motion rather than its (missing) text. Falls back to byte comparison
+ * when either frame can't be decoded.
+ */
+fun screenshotsDiffer(a: ByteArray, b: ByteArray, tolerance: Double = 0.005): Boolean {
+    val ga = decodeGrid(a) ?: return !a.contentEquals(b)
+    val gb = decodeGrid(b) ?: return !a.contentEquals(b)
+    return !gridsSettled(ga, gb, tolerance)
+}
+
 /** Number of sample points per axis used by the tolerant frame comparison. */
 private const val GRID = 48
 

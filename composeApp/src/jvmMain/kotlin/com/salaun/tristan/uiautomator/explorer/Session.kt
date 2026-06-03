@@ -38,6 +38,17 @@ data class ExplorationConfig(
     val settleDelayMs: Long = 500,
     /** Upper bound for the active "wait until two screenshots match" loop. */
     val idleMaxWaitMs: Long = 8_000,
+    /**
+     * Upper bound on how long the explorer waits out a *long-running operation*
+     * screen — a firmware update, a download, a "connecting / please wait"
+     * spinner — before giving up and proceeding with whatever is on screen.
+     * Such screens routinely outlast [idleMaxWaitMs] by minutes (a first-time
+     * Hub firmware flash, for instance). The explorer detects them and polls
+     * until the app moves on, capped here; it exits early the moment the
+     * operation finishes, so a generous cap only costs time when something is
+     * genuinely stuck. 0 disables the extended wait.
+     */
+    val longOperationMaxWaitMs: Long = 300_000,
 )
 
 @Serializable

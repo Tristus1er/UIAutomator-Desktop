@@ -207,6 +207,50 @@ class StateOpsTest {
     }
 
     @Test
+    fun `isLongRunningOperation flags firmware updates and connecting spinners, not normal screens`() {
+        fun parseXml(x: String) = assertNotNull(DumpParser.parse(x))
+        val firmware = parseXml("""<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Updating firmware… Do not turn off the device" class="android.widget.TextView" resource-id="com.example.app:id/msg" package="com.example.app" clickable="false" enabled="true" bounds="[40,800][1040,1000]"/>
+    <node index="1" class="android.widget.ProgressBar" package="com.example.app" clickable="false" enabled="true" bounds="[40,1100][1040,1160]"/>
+  </node>
+</hierarchy>""")
+        val connecting = parseXml("""<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Connecting" class="android.widget.TextView" package="com.example.app" clickable="false" enabled="true" bounds="[40,800][1040,900]"/>
+    <node index="1" class="android.widget.ProgressBar" package="com.example.app" clickable="false" enabled="true" bounds="[480,1100][600,1220]"/>
+  </node>
+</hierarchy>""")
+        assertTrue(StateOps.isLongRunningOperation(firmware), "firmware update must be detected")
+        assertTrue(StateOps.isLongRunningOperation(connecting), "connecting spinner with no actions must be detected")
+        // A normal screen (buttons, no progress/update text) must NOT be flagged.
+        assertTrue(
+            !StateOps.isLongRunningOperation(parse("sample_dump.xml")),
+            "an ordinary interactive screen must not be treated as a long operation",
+        )
+
+        // Regression: content screens that merely *mention* update/connection
+        // words must NOT be mistaken for an operation (these cost 5-min waits).
+        val lastUpdateLabel = parseXml("""<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Dernière mise à jour : 8 octobre 2024" class="android.widget.TextView" package="com.example.app" clickable="false" enabled="true" bounds="[40,200][1040,300]"/>
+    <node index="1" text="OK" class="android.widget.Button" resource-id="com.example.app:id/ok" package="com.example.app" clickable="true" enabled="true" bounds="[40,400][1040,520]"/>
+  </node>
+</hierarchy>""")
+        val review = parseXml("""<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Excellente application avec juste un petit bémol sur la connexion au début" class="android.widget.TextView" package="com.example.app" clickable="false" enabled="true" bounds="[40,200][1040,500]"/>
+  </node>
+</hierarchy>""")
+        assertTrue(!StateOps.isLongRunningOperation(lastUpdateLabel), "'last update: date' is content, not an operation")
+        assertTrue(!StateOps.isLongRunningOperation(review), "a review paragraph mentioning 'connexion' is not a connecting screen")
+    }
+
+    @Test
     fun `findPermissionAllowNode picks 'While using the app' and never the 'Don't allow' button`() {
         // Regression for the location prompt: it has NO plain "Allow" button,
         // only "While using the app" / "Only this time" / "Don't allow". The

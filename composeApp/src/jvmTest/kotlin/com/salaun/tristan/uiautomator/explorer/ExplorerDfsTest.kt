@@ -400,6 +400,123 @@ class ExplorerDfsTest {
     }
 
     @Test
+    fun `a long-running firmware-update screen is waited out, then the next screen is explored`() {
+        // Tapping "start" kicks off a firmware update that shows a progress
+        // screen for several polls before the app moves on to "done". The
+        // explorer must wait it out and register the screen the app lands on —
+        // not the transient progress screen.
+        val updatingXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Updating firmware… do not turn off" class="android.widget.TextView" resource-id="com.example.app:id/msg" package="com.example.app" clickable="false" enabled="true" bounds="[40,800][1040,1000]"/>
+    <node index="1" class="android.widget.ProgressBar" package="com.example.app" clickable="false" enabled="true" bounds="[40,1100][1040,1160]"/>
+  </node>
+</hierarchy>"""
+        val gw = object : com.salaun.tristan.uiautomator.adb.AdbGateway {
+            var screen = "home"
+            var updatingDumps = 0
+            var launches = 0
+            override suspend fun launchApp(serial: String?, pkg: String) { screen = "home"; launches++ }
+            override suspend fun pressBack(serial: String?) {}
+            override suspend fun inputTap(serial: String?, x: Int, y: Int) {
+                if (screen == "home" && y < 150) screen = "updating"
+            }
+            override suspend fun inputSwipe(serial: String?, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int) {}
+            override suspend fun screenshotPng(serial: String?): ByteArray = byteArrayOf(1)
+            override suspend fun dumpUiXml(serial: String?): String = when (screen) {
+                "home" -> screen("home", listOf(Btn("start", 100, 100)))
+                "updating" -> {
+                    updatingDumps++
+                    if (updatingDumps >= 3) { screen = "done"; screen("done") } else updatingXml
+                }
+                else -> screen("done")
+            }
+        }
+        val session = runBlocking {
+            val store = SessionStore(tmp.newFolder("session"))
+            val config = ExplorationConfig(targetPackage = pkg, settleDelayMs = 0, longOperationMaxWaitMs = 60_000)
+            Explorer(gw, serial = null, config = config, store = store).run(SilentListener)
+        }
+
+        // home + done; the transient "updating" screen must NOT be registered.
+        assertEquals(2, session.states.size, "the progress screen must not become a state")
+        assertTrue(
+            session.transitions.any { it.from == "S0" && it.to == "S1" && it.action.resourceId.endsWith("/start") },
+            "after the update finishes, the resulting screen is explored as a new state",
+        )
+        assertEquals(1, gw.launches, "waiting out the operation must not relaunch the app")
+    }
+
+    @Test
+    fun `a deep button behind a now-granted permission gate is still exercised`() {
+        // Reproduces the egg-config bug: `deep` is reachable only by tapping
+        // through a permission gate, and its first DOM element is a back arrow.
+        // The crawler must (a) tap the screen's real button (`validate`) before
+        // the back arrow thanks to dismiss-deferral, and (b) re-reach `deep` for
+        // its remaining elements via re-planning navigation even though the
+        // permission dialog no longer appears once granted (so the recorded
+        // home→perm→mid path is stale). Without these fixes "validate" was lost.
+        val permXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.android.permissioncontroller" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" text="Allow" class="android.widget.Button" resource-id="com.android.permissioncontroller:id/permission_allow_button" package="com.android.permissioncontroller" clickable="true" enabled="true" bounds="[120,1700][960,1800]"/>
+    <node index="1" text="Don't allow" class="android.widget.Button" resource-id="com.android.permissioncontroller:id/permission_deny_button" package="com.android.permissioncontroller" clickable="true" enabled="true" bounds="[120,1940][960,2040]"/>
+  </node>
+</hierarchy>"""
+        val deepXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" class="android.widget.TextView" resource-id="com.example.app:id/marker_deep" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1,1]"/>
+    <node index="1" class="android.widget.ImageView" resource-id="com.example.app:id/arrow_back" package="com.example.app" clickable="true" enabled="true" bounds="[20,20][80,80]"/>
+    <node index="2" text="Validate" class="android.widget.Button" resource-id="com.example.app:id/validate" package="com.example.app" clickable="true" enabled="true" bounds="[40,250][160,350]"/>
+  </node>
+</hierarchy>"""
+        val gw = object : com.salaun.tristan.uiautomator.adb.AdbGateway {
+            val xml = mapOf(
+                "home" to screen("home", listOf(Btn("enter", 100, 100))),
+                "perm" to permXml,
+                "mid" to screen("mid", listOf(Btn("dive", 100, 100))),
+                "deep" to deepXml,
+                "final" to screen("final"),
+            )
+            var granted = false
+            var screen = "home"
+            var launches = 0
+            override suspend fun launchApp(serial: String?, pkg: String) { screen = "home"; launches++ }
+            override suspend fun pressBack(serial: String?) {
+                screen = when (screen) {
+                    "final" -> "deep"
+                    "deep" -> "mid"
+                    "mid" -> "home"
+                    else -> screen
+                }
+            }
+            override suspend fun inputTap(serial: String?, x: Int, y: Int) {
+                when (screen) {
+                    "home" -> if (y < 150) screen = if (granted) "mid" else "perm"
+                    "perm" -> if (y in 1650..1850) { granted = true; screen = "mid" } // Allow
+                    "mid" -> if (y < 150) screen = "deep"
+                    "deep" -> screen = if (y < 150) "home" else "final" // arrow_back vs validate
+                }
+            }
+            override suspend fun inputSwipe(serial: String?, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int) {}
+            override suspend fun screenshotPng(serial: String?): ByteArray = byteArrayOf(1)
+            override suspend fun dumpUiXml(serial: String?): String = xml.getValue(screen)
+        }
+        val session = runBlocking {
+            val store = SessionStore(tmp.newFolder("session"))
+            val config = ExplorationConfig(targetPackage = pkg, settleDelayMs = 0)
+            Explorer(gw, serial = null, config = config, store = store).run(SilentListener)
+        }
+
+        val deep = session.states.single { it.packageName == pkg && it.clickables.any { c -> c.resourceId.endsWith("/validate") } }
+        assertTrue(
+            session.transitions.any { it.from == deep.id && it.action.resourceId.endsWith("/validate") && it.to != null },
+            "the deep 'Validate' button behind the permission gate must be exercised",
+        )
+    }
+
+    @Test
     fun `permission dialog is captured as a state and the grant recorded as a transition`() {
         // The `request_perm` button of `home` mounts a system permission
         // dialog from `com.android.permissioncontroller`. The explorer must

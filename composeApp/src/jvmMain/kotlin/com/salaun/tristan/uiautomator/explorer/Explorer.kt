@@ -229,12 +229,38 @@ class Explorer(
     private val preparedStates = HashSet<String>()
 
     /**
+     * Structure fingerprints of wait screens that already exhausted their wait
+     * budget without finishing (e.g. a Hub that never connects). We never wait
+     * on them again, so a single stuck spinner can't cost the exploration its
+     * timeout over and over.
+     */
+    private val timedOutWaitScreens = HashSet<String>()
+
+    /**
      * States we have given up reaching from the live context (navigation and a
      * last-resort relaunch both failed). Their remaining clickables stay
      * unexercised but the frontier loop no longer selects them, so it
      * terminates instead of spinning on an unreachable screen.
      */
     private val exhaustedStates = HashSet<String>()
+
+    /**
+     * Ids of captured permission-dialog screens. They are **one-time**: once
+     * granted, the system never shows them again, so navigation must NOT route
+     * through them (their incoming/outgoing edges are stale the moment the
+     * grant happens). The crawler instead uses [navShortcuts] to jump straight
+     * from the triggering screen to the screen behind the gate.
+     */
+    private val permissionDialogStateIds = HashSet<String>()
+
+    /**
+     * Post-grant navigation shortcuts: tapping the trigger element on the
+     * source screen now lands directly on the behind-the-gate screen (the
+     * permission dialog no longer intervenes). Recorded when a permission is
+     * resolved and used by the navigation planner in place of the stale
+     * source→dialog→…→behind chain.
+     */
+    private val navShortcuts = mutableListOf<NavStep.Forward>()
 
     /** A single navigation move: a recorded forward tap, or a BACK press. */
     private sealed class NavStep {
@@ -243,6 +269,31 @@ class Explorer(
         data class Forward(override val from: String, override val to: String, val action: ClickableRef) : NavStep()
         data class Back(override val from: String, override val to: String) : NavStep()
     }
+
+    /**
+     * Forward edges usable for navigation: the recorded productive transitions
+     * **minus** any edge touching a one-time permission-dialog state, **plus**
+     * the post-grant [navShortcuts]. This is what makes re-reaching a screen
+     * behind a granted permission deterministic instead of relying on drift
+     * detection.
+     */
+    private fun navForwardEdges(): List<NavStep.Forward> {
+        val out = ArrayList<NavStep.Forward>()
+        for (t in session.transitions) {
+            val to = t.to ?: continue
+            if (t.loop || t.leftApp || t.errorMessage != null || to == t.from) continue
+            if (t.from in permissionDialogStateIds || to in permissionDialogStateIds) continue
+            out += NavStep.Forward(t.from, to, t.action)
+        }
+        out += navShortcuts
+        return out
+    }
+
+    /** BACK edges usable for navigation (excluding any touching a one-time dialog). */
+    private fun navBackEdges(): List<NavStep.Back> =
+        backLeadsTo.entries
+            .filter { it.key !in permissionDialogStateIds && it.value !in permissionDialogStateIds }
+            .map { NavStep.Back(it.key, it.value) }
 
     /**
      * Context-preserving frontier exploration. Keeps the app running and walks
@@ -261,7 +312,12 @@ class Explorer(
             if (current.id !in exhaustedStates && branchDepth(current.id) < config.maxDepth) {
                 prepareStateForExploration(current)
                 current = session.states.firstOrNull { it.id == current.id } ?: current
-                val click = current.clickables.firstOrNull { !isExercised(current, it) }
+                // Exercise the screen's real content before its back/close
+                // affordance, so we don't leave a screen the instant we tap the
+                // top-left back arrow and abandon its primary buttons.
+                val click = current.clickables
+                    .filter { !isExercised(current, it) }
+                    .minByOrNull { if (StateOps.isLikelyDismissAction(it)) 1 else 0 }
                 if (click != null) {
                     val landed = exerciseClickable(current, click)
                     current = landed ?: reanchor() ?: relaunchToRoot() ?: break
@@ -369,79 +425,91 @@ class Explorer(
         return frontier.minByOrNull { it.id }
     }
 
-    /** Forward (recorded) + BACK (learned) adjacency for navigation BFS. */
+    /** Forward + BACK adjacency for navigation BFS (one-time dialogs excluded). */
     private fun navAdjacency(): Map<String, Set<String>> {
         val adj = HashMap<String, MutableSet<String>>()
-        for (t in session.transitions) {
-            val to = t.to
-            if (to != null && !t.loop && !t.leftApp && t.errorMessage == null && to != t.from) {
-                adj.getOrPut(t.from) { HashSet() }.add(to)
-            }
-        }
-        for ((f, to) in backLeadsTo) adj.getOrPut(f) { HashSet() }.add(to)
+        for (e in navForwardEdges()) adj.getOrPut(e.from) { HashSet() }.add(e.to)
+        for (e in navBackEdges()) adj.getOrPut(e.from) { HashSet() }.add(e.to)
         return adj
     }
 
     /**
-     * Drives the device from [from] to [target] along a shortest navigation
-     * path, verifying the landing after every move and learning BACK edges as
-     * it goes. Returns [target] on success, or `null` on drift / no known path
-     * (the caller then falls back to a relaunch).
+     * Drives the device from [from] to [target], **re-planning after every
+     * move**. Each step we compute only the *next* hop toward [target], execute
+     * it, observe which known state we actually landed on, and plan again from
+     * there.
+     *
+     * Re-planning (instead of committing to one precomputed path) is what makes
+     * navigation robust to edges that have gone stale since they were recorded
+     * — most importantly a permission dialog that no longer appears once
+     * granted, so its trigger now lands one (or several) screens *past* the
+     * dialog state in the recorded chain. The old "follow the path, fail on the
+     * first mismatch" logic treated that as drift and relaunched, stranding
+     * every screen behind the permission gate (this is exactly why "Start
+     * detection" on the egg-config screen never got tapped). Now a drift onto a
+     * known state simply re-plans from it and keeps going.
+     *
+     * Returns [target] on success, or `null` when a move lands on an unknown
+     * screen or no path remains (the caller then falls back to a relaunch).
      */
     private suspend fun navigateTo(from: StateEntry, target: StateEntry): StateEntry? {
-        if (from.id == target.id) return if (verifyOn(target)) target else null
-        val steps = navPath(from.id, target.id) ?: return null
-        listener.onLog("→ ${from.id} ⇒ ${target.id} via ${steps.size} step(s)")
-        for (step in steps) {
-            val ok = when (step) {
+        var curId = from.id
+        if (curId == target.id) return if (verifyOn(target)) target else null
+        listener.onLog("→ ${from.id} ⇒ ${target.id}")
+        val maxMoves = session.states.size + BACK_RECOVERY_ATTEMPTS + 4
+        repeat(maxMoves) {
+            if (curId == target.id) return if (verifyOn(target)) target else null
+            val step = navPath(curId, target.id)?.firstOrNull() ?: return null
+            val landed: String? = when (step) {
                 is NavStep.Forward -> {
                     if (step.action.scrollToReveal > 0) scrollDownTimes(step.action.scrollToReveal)
                     runCatching { adb.inputTap(serial, step.action.tapX, step.action.tapY) }
                     delay(config.settleDelayMs)
                     val snap = runCatching { capture() }.getOrNull() ?: return null
-                    fingerprintToId[snap.fingerprint] == step.to
+                    fingerprintToId[snap.fingerprint]
                 }
-                // BACK may take more than one press to climb past an interstitial
-                // (a confirmation overlay, an IME, a transient screen the app
-                // pops on its own). Retry a few times, learning where BACK
-                // actually lands, before declaring drift — this is what keeps a
-                // sibling reachable without a context-destroying relaunch.
                 is NavStep.Back -> climbBackTo(step)
             }
-            if (!ok) {
-                listener.onLog("  ✘ nav drift heading for ${step.to}")
+            if (landed == null) {
+                listener.onLog("  ✘ nav lost on an unknown screen heading for ${target.id}")
                 return null
             }
+            if (step is NavStep.Forward && landed != step.to) {
+                listener.onLog("  ↻ ${step.from}→${step.to} actually landed on $landed (stale edge) — re-planning")
+            }
+            if (landed == curId && step is NavStep.Back) return null // BACK made no progress
+            curId = landed
         }
-        return if (verifyOn(target)) target else null
+        return null
     }
 
-    /** Presses BACK up to [BACK_RECOVERY_ATTEMPTS] times trying to land on [step].to. */
-    private suspend fun climbBackTo(step: NavStep.Back): Boolean {
+    /**
+     * Presses BACK up to [BACK_RECOVERY_ATTEMPTS] times and returns the known
+     * state it lands on (the navigation target, or any other known screen so
+     * the caller can re-plan), or `null` if it only ever lands on unknown
+     * screens. Multiple presses climb past interstitials (a confirmation
+     * overlay, an IME, a transient screen the app pops on its own).
+     */
+    private suspend fun climbBackTo(step: NavStep.Back): String? {
         repeat(BACK_RECOVERY_ATTEMPTS) {
             runCatching { adb.pressBack(serial) }
             delay(config.settleDelayMs)
-            val snap = runCatching { capture() }.getOrNull() ?: return false
+            val snap = runCatching { capture() }.getOrNull() ?: return null
             val landed = fingerprintToId[snap.fingerprint]
-            if (landed != null) backLeadsTo[step.from] = landed
-            if (landed == step.to) return true
-            // Landed on a *different* known state: BACK overshot the target;
-            // further presses will only move farther away.
-            if (landed != null) return false
+            if (landed != null) {
+                backLeadsTo[step.from] = landed
+                return landed
+            }
+            // Unknown screen: keep pressing BACK (likely a dismissible overlay).
         }
-        return false
+        return null
     }
 
     /** Shortest navigation path [from]→[target], or `null` when none is known. */
     private fun navPath(from: String, target: String): List<NavStep>? {
         val adj = HashMap<String, MutableList<NavStep>>()
-        for (t in session.transitions) {
-            val to = t.to
-            if (to != null && !t.loop && !t.leftApp && t.errorMessage == null && to != t.from) {
-                adj.getOrPut(t.from) { mutableListOf() } += NavStep.Forward(t.from, to, t.action)
-            }
-        }
-        for ((f, to) in backLeadsTo) adj.getOrPut(f) { mutableListOf() } += NavStep.Back(f, to)
+        for (e in navForwardEdges()) adj.getOrPut(e.from) { mutableListOf() } += e
+        for (e in navBackEdges()) adj.getOrPut(e.from) { mutableListOf() } += e
 
         val prev = HashMap<String, NavStep>()
         val visited = HashSet<String>().apply { add(from) }
@@ -506,7 +574,10 @@ class Explorer(
             if (click.scrollToReveal > 0) scrollDownTimes(click.scrollToReveal)
             adb.inputTap(serial, click.tapX, click.tapY)
             delay(config.settleDelayMs)
-            after = capture()
+            // If the tap kicked off a firmware flash / download / connecting
+            // spinner, patiently wait it out so we classify the screen the app
+            // moves on to — not the transient progress screen.
+            after = waitOutLongOperation(capture())
         } catch (e: Exception) {
             val reason = e.message ?: e::class.simpleName.orEmpty()
             listener.onLog("  ✘ « ${click.label} » failed: $reason")
@@ -703,6 +774,9 @@ class Explorer(
             session.transitions += TransitionEntry(
                 grant.lastDialogId, knownId, grant.lastAllowAction, loop = knownId == grant.lastDialogId,
             )
+            // Post-grant shortcut: tapping the trigger on `source` now lands
+            // straight on this screen (the dialog is gone).
+            navShortcuts += NavStep.Forward(source.id, knownId, click)
             return session.states.firstOrNull { it.id == knownId }
         }
         val child = registerState(
@@ -713,6 +787,7 @@ class Explorer(
         fingerprintToId[behind.fingerprint] = child.id
         session.transitions += TransitionEntry(grant.lastDialogId, child.id, grant.lastAllowAction)
         backLeadsTo[child.id] = source.id
+        navShortcuts += NavStep.Forward(source.id, child.id, click)
         listener.onLog("  → new ${child.id} behind permission (${child.clickables.size} actions)")
         emit(child.id, null)
         return child
@@ -742,7 +817,10 @@ class Explorer(
         )
         session.states += entry
         structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
-        listener.onLog("  📋 captured permission dialog as $id")
+        // Flag it as one-time: navigation must never try to route back through
+        // this dialog, because once granted the system won't show it again.
+        permissionDialogStateIds += id
+        listener.onLog("  📋 captured permission dialog as $id (one-time)")
         return entry
     }
 
@@ -1060,6 +1138,79 @@ class Explorer(
         }
     }
 
+    /**
+     * If [initial] is a long-running operation screen (firmware update,
+     * download, "connecting / please wait" spinner — see
+     * [StateOps.isLongRunningOperation]), polls the device until the app moves
+     * on to a different, non-operation screen, then returns that capture. Caps
+     * the wait at [ExplorationConfig.longOperationMaxWaitMs] and exits the
+     * moment the operation finishes, so it costs real time only while something
+     * is actually running. Returns [initial] unchanged for normal screens.
+     *
+     * Completion is detected on the **structure** fingerprint (text-free DOM
+     * skeleton): a progress bar filling or a "50% → 51%" caption does not change
+     * the skeleton, but navigating to the next screen does — so we wait exactly
+     * as long as the operation, not a fixed delay.
+     */
+    private suspend fun waitOutLongOperation(initial: Snapshot): Snapshot {
+        if (config.longOperationMaxWaitMs <= 0) return initial
+        // Never wait twice on the same screen that already timed out — a stuck
+        // spinner (a Hub that won't connect) must cost its budget at most once.
+        val key = StateOps.structureFingerprint(initial.root)
+        if (key in timedOutWaitScreens) return initial
+        if (!isWaitScreen(initial)) return initial
+        val label = StateOps.longOperationLabel(initial.root)
+        val budgetS = config.longOperationMaxWaitMs / 1000
+        listener.onLog("  ⏳ long operation${if (label.isNotBlank()) " « $label »" else ""} — waiting up to ${budgetS}s for it to finish…")
+        val start = System.currentTimeMillis()
+        var lastHeartbeat = start
+        while (System.currentTimeMillis() - start < config.longOperationMaxWaitMs && coroutineContext.isActive) {
+            delay(LONG_OP_POLL_MS)
+            val snap = runCatching { capture() }.getOrNull() ?: continue
+            // Done once the app reaches a screen that is no longer a wait screen
+            // (it has real actions, or it's a static non-operation screen). This
+            // walks chains like connecting → updating → dashboard.
+            if (!isWaitScreen(snap)) {
+                listener.onLog("  ✓ long operation finished after ${(System.currentTimeMillis() - start) / 1000}s")
+                return snap
+            }
+            if (System.currentTimeMillis() - lastHeartbeat > 30_000) {
+                lastHeartbeat = System.currentTimeMillis()
+                listener.onLog("  ⏳ still running (${(System.currentTimeMillis() - start) / 1000}s elapsed)…")
+            }
+        }
+        listener.onLog("  ⚠ long operation still running after ${budgetS}s — giving up on this screen (won't wait on it again)")
+        timedOutWaitScreens += key
+        return runCatching { capture() }.getOrDefault(initial)
+    }
+
+    /**
+     * `true` when [snap] is a screen the explorer should patiently wait out:
+     * either it explicitly names an active operation (firmware / updating /
+     * progress bar — see [StateOps.isLongRunningOperation]), or it has **no
+     * actionable element, no content text, and is animating**. The latter
+     * catches a Compose "Connecting / loading" spinner whose caption is painted
+     * but never reaches the accessibility dump — recognised by its motion plus
+     * the absence of anything to tap or read. The "no content text" clause is
+     * what keeps an animated *content* screen (an auto-scrolling review
+     * carousel) from being mistaken for a wait screen.
+     */
+    private suspend fun isWaitScreen(snap: Snapshot): Boolean {
+        if (StateOps.isLongRunningOperation(snap.root)) return true
+        val noActions = StateOps.collectClickables(snap.root, config.targetPackage, 1).isEmpty() &&
+            StateOps.collectEditableFields(snap.root, config.targetPackage).isEmpty()
+        if (!noActions || StateOps.hasMeaningfulText(snap.root)) return false
+        return isScreenAnimating()
+    }
+
+    /** Takes two screenshots a short moment apart and reports whether the screen is moving. */
+    private suspend fun isScreenAnimating(): Boolean {
+        val a = runCatching { adb.screenshotPng(serial) }.getOrNull() ?: return false
+        delay(450)
+        val b = runCatching { adb.screenshotPng(serial) }.getOrNull() ?: return false
+        return screenshotsDiffer(a, b)
+    }
+
     private suspend fun capture(): Snapshot {
         // 1. Actively wait for the screen to stabilise, polling screenshots only.
         //    This keeps us out of `uiautomator dump`'s "could not get idle state" trap:
@@ -1160,5 +1311,8 @@ class Explorer(
          * reliable than guessing.
          */
         const val BACK_RECOVERY_ATTEMPTS = 3
+
+        /** Poll interval while waiting out a long-running operation screen. */
+        const val LONG_OP_POLL_MS = 3_000L
     }
 }

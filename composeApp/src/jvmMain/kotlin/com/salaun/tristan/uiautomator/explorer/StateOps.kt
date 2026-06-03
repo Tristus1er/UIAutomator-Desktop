@@ -256,6 +256,110 @@ object StateOps {
         }
     }
 
+    /** Words (matched on text / content-desc, lower-case, whole value) that mark a dismiss action. */
+    private val DISMISS_WORDS = setOf(
+        "back", "navigate up", "up", "close", "cancel", "dismiss",
+        "retour", "fermer", "annuler", "précédent", "precedent",
+    )
+
+    /**
+     * Heuristic: this clickable most likely navigates *away from* / dismisses
+     * the current screen — a back arrow, close, cancel or up affordance. The
+     * explorer exercises such actions LAST on a screen, so it walks the
+     * screen's real content first instead of leaving the moment it taps the
+     * top-left back arrow. The egg-config "Start detection" button was lost
+     * exactly this way: `arrow_back` sat first in DOM order, so the crawler
+     * left before ever reaching the primary button.
+     */
+    fun isLikelyDismissAction(c: ClickableRef): Boolean {
+        val id = c.resourceId.substringAfterLast('/').lowercase()
+        val idHit = id == "back" || id == "up" || id == "close" || id == "cancel" ||
+            id.contains("arrow_back") || id.contains("back_button") || id.contains("btn_back") ||
+            id.contains("_back") || id.contains("navigate_up") ||
+            id.contains("close_button") || id.contains("btn_close") || id.contains("toolbar_back")
+        val textHit = c.contentDesc.trim().lowercase() in DISMISS_WORDS || c.text.trim().lowercase() in DISMISS_WORDS
+        return idHit || textHit
+    }
+
+    /**
+     * Phrases that name an *active* long-running operation (a firmware flash, a
+     * download in progress, an OS-style "do not turn off" warning). They are
+     * deliberately specific — "mise à jour en cours" (update **in progress**),
+     * not bare "mise à jour" which also appears in "Dernière mise à jour : 8
+     * octobre 2024" — and are only honoured on a **short caption**, never
+     * inside a content paragraph (a product review mentioning "connexion" must
+     * not be mistaken for a connecting screen). Both rules come from real
+     * false positives that made the explorer wait 5 minutes on ordinary
+     * content screens.
+     */
+    private val ACTIVE_OP_PHRASES = listOf(
+        "updating", "update in progress", "updating firmware", "firmware update",
+        "mise à jour en cours", "mise a jour en cours",
+        "installing", "installation en cours", "flashing",
+        "downloading", "téléchargement en cours", "telechargement en cours",
+        "do not turn off", "do not unplug", "do not close the app",
+        "n'éteignez pas", "n'eteignez pas", "ne débranchez pas", "ne debranchez pas",
+        "please wait", "veuillez patienter",
+        "connexion en cours", "pairing", "appairage en cours",
+        "syncing", "synchronisation en cours", "preparing", "préparation en cours",
+    )
+
+    /** Max length of a text node still considered a status *caption* (vs a paragraph). */
+    private const val CAPTION_MAX_LEN = 45
+
+    /**
+     * `true` when [root] explicitly names a long-running operation in a short
+     * caption, or shows a progress bar on an otherwise actionless screen. This
+     * is the *textual* signal; the explorer additionally treats an actionless,
+     * text-free, animating screen (a Compose "Connecting" spinner whose caption
+     * never reaches the accessibility dump) as a wait screen — see
+     * `Explorer.isWaitScreen`.
+     */
+    fun isLongRunningOperation(root: UiNode): Boolean {
+        var hasProgress = false
+        var phrase = false
+        var clickables = 0
+        root.walk { n ->
+            if (n.className.contains("ProgressBar")) {
+                val b = n.bounds
+                if (b != null && b.width > 4 && b.height > 4) hasProgress = true
+            }
+            if (n.clickable && n.enabled) {
+                val b = n.bounds
+                if (b != null && b.width > 0 && b.height > 0) clickables++
+            }
+            val raw = n.text.ifBlank { n.contentDesc }.trim()
+            if (raw.length in 1..CAPTION_MAX_LEN) {
+                val low = raw.lowercase()
+                if (ACTIVE_OP_PHRASES.any { low.contains(it) }) phrase = true
+            }
+        }
+        return phrase || (hasProgress && clickables <= 1)
+    }
+
+    /** `true` when any node carries real text (≥ 3 chars) — i.e. the screen has content. */
+    fun hasMeaningfulText(root: UiNode): Boolean {
+        var found = false
+        root.walk { n ->
+            if (found) return@walk
+            if (n.text.ifBlank { n.contentDesc }.trim().length >= 3) found = true
+        }
+        return found
+    }
+
+    /** A short human label for a long-operation screen (for logging), or "". */
+    fun longOperationLabel(root: UiNode): String {
+        var label = ""
+        root.walk { n ->
+            if (label.isNotBlank()) return@walk
+            val raw = n.text.ifBlank { n.contentDesc }.trim()
+            if (raw.length in 1..CAPTION_MAX_LEN && ACTIVE_OP_PHRASES.any { raw.lowercase().contains(it) }) {
+                label = raw.take(40)
+            }
+        }
+        return label
+    }
+
     /**
      * Collects every clickable element on screen, with a per-sibling-group cap.
      *
