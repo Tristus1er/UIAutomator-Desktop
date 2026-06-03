@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<hierarchy rotation="0">
+  <!--
+    Wheel-style hour picker fixture. Mimics the Android NumberPicker layout
+    served by `uiautomator dump` on a real device: a container of class
+    `android.widget.NumberPicker` whose visible children are the
+    decrement/increment buttons (without resource-id) and the editable
+    current-value EditText (`numberpicker_input`). Used to verify that
+    StateOps.isInsideWheelPicker / collectClickables flag every tappable
+    child as a wheel-picker click.
+  -->
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][1080,2400]">
+    <node index="0" text="At what time would you like to wake up?" resource-id="com.example.app:id/title" class="android.widget.TextView" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[40,200][1040,300]"/>
+    <node index="1" text="" resource-id="" class="android.widget.LinearLayout" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[40,400][1040,1200]">
+      <node index="0" text="" resource-id="" class="android.widget.NumberPicker" package="com.example.app" content-desc="hour picker" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="true" long-clickable="false" password="false" selected="false" bounds="[100,400][500,1200]">
+        <node index="0" text="22" resource-id="" class="android.widget.Button" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[100,400][500,640]"/>
+        <node index="1" text="23" resource-id="android:id/numberpicker_input" class="android.widget.EditText" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[100,640][500,960]"/>
+        <node index="2" text="00" resource-id="" class="android.widget.Button" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[100,960][500,1200]"/>
+      </node>
+      <node index="1" text="" resource-id="" class="android.widget.NumberPicker" package="com.example.app" content-desc="minute picker" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="true" long-clickable="false" password="false" selected="false" bounds="[580,400][980,1200]">
+        <node index="0" text="59" resource-id="" class="android.widget.Button" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[580,400][980,640]"/>
+        <node index="1" text="00" resource-id="android:id/numberpicker_input" class="android.widget.EditText" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[580,640][980,960]"/>
+        <node index="2" text="01" resource-id="" class="android.widget.Button" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[580,960][980,1200]"/>
+      </node>
+    </node>
+    <node index="2" text="Validate" resource-id="com.example.app:id/validate_timer_button" class="android.widget.Button" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[200,1400][880,1600]"/>
+  </node>
+</hierarchy>

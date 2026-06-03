@@ -27,6 +27,8 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import com.salaun.tristan.uiautomator.i18n.LocalStrings
+import com.salaun.tristan.uiautomator.model.UiBounds
 import com.salaun.tristan.uiautomator.model.UiNode
 import org.jetbrains.skia.Image as SkiaImage
 import kotlin.math.min
@@ -39,6 +41,11 @@ fun ScreenshotPanel(
     onNodeHovered: (UiNode?) -> Unit,
     onNodeClicked: (UiNode?) -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * Rectangles drawn permanently on top of the screenshot. Used by the
+     * enlarged-capture window to highlight every clickable element.
+     */
+    clickableBounds: List<UiBounds> = emptyList(),
 ) {
     val bitmap: ImageBitmap? = remember(pngBytes) {
         pngBytes?.let {
@@ -54,7 +61,7 @@ fun ScreenshotPanel(
     ) {
         if (bitmap == null) {
             Text(
-                "Cliquez sur « Capturer » pour récupérer une copie d'écran.",
+                LocalStrings.current.screenshotHint,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             return@Box
@@ -73,6 +80,11 @@ fun ScreenshotPanel(
             val drawnHdp = with(density) { drawnHpx.toDp() }
 
             var lastHovered by remember { mutableStateOf<UiNode?>(null) }
+            // When the user clicks an element we "pin" the selection: further
+            // mouse moves inside the screenshot are ignored, which gives them
+            // a chance to look up the node in the XML tree on the side without
+            // losing the highlight. Pointer exit releases the pin.
+            var pinned by remember { mutableStateOf(false) }
 
             Box(
                 modifier = Modifier
@@ -85,20 +97,31 @@ fun ScreenshotPanel(
                                 val pos = ev.changes.firstOrNull()?.position
                                 when (ev.type) {
                                     PointerEventType.Move, PointerEventType.Enter -> {
-                                        val node = pos?.let { hitTest(rootNode, it, scale) }
-                                        if (node !== lastHovered) {
-                                            lastHovered = node
-                                            onNodeHovered(node)
+                                        if (!pinned) {
+                                            val node = pos?.let { hitTest(rootNode, it, scale) }
+                                            if (node !== lastHovered) {
+                                                lastHovered = node
+                                                onNodeHovered(node)
+                                            }
                                         }
                                     }
                                     PointerEventType.Exit -> {
-                                        if (lastHovered != null) {
+                                        // Leaving the screenshot releases any pin. If nothing
+                                        // was pinned we also clear the hover selection so the
+                                        // caller knows the pointer has gone elsewhere.
+                                        if (pinned) {
+                                            pinned = false
+                                        } else if (lastHovered != null) {
                                             lastHovered = null
                                             onNodeHovered(null)
                                         }
                                     }
                                     PointerEventType.Press -> {
                                         val node = pos?.let { hitTest(rootNode, it, scale) }
+                                        pinned = node != null
+                                        // Update lastHovered too so re-entry over the same
+                                        // node does not re-fire onNodeHovered redundantly.
+                                        lastHovered = node
                                         onNodeClicked(node)
                                     }
                                     else -> {}
@@ -113,6 +136,24 @@ fun ScreenshotPanel(
                     modifier = Modifier.fillMaxSize(),
                 )
                 Canvas(modifier = Modifier.fillMaxSize()) {
+                    // Permanent "clickable" overlays (drawn first so the red selection overlay sits on top).
+                    for (b in clickableBounds) {
+                        val x = b.left * scale
+                        val y = b.top * scale
+                        val w = b.width * scale
+                        val h = b.height * scale
+                        drawRect(
+                            color = Color(0x332196F3),
+                            topLeft = Offset(x, y),
+                            size = Size(w, h),
+                        )
+                        drawRect(
+                            color = Color(0xFF1976D2),
+                            topLeft = Offset(x, y),
+                            size = Size(w, h),
+                            style = Stroke(width = 1.5f),
+                        )
+                    }
                     selectedNode?.bounds?.let { b ->
                         val x = b.left * scale
                         val y = b.top * scale

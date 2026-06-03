@@ -32,6 +32,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.salaun.tristan.uiautomator.AppState
 import com.salaun.tristan.uiautomator.Screen
+import com.salaun.tristan.uiautomator.i18n.LocalStrings
 
 @Composable
 fun MainScreen(state: AppState) {
@@ -53,6 +54,8 @@ fun MainScreen(state: AppState) {
                 expanded = state.expanded,
                 selectedNode = state.selectedNode,
                 onToggle = { state.toggle(it) },
+                // `it` is now nullable: the tree clears its hover-driven
+                // selection when the pointer leaves the panel.
                 onSelect = { state.selectNode(it) },
                 modifier = Modifier.weight(1f).fillMaxHeight(),
             )
@@ -62,6 +65,7 @@ fun MainScreen(state: AppState) {
 
 @Composable
 private fun Toolbar(state: AppState) {
+    val strings = LocalStrings.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -73,13 +77,15 @@ private fun Toolbar(state: AppState) {
         Button(
             onClick = { state.capture() },
             enabled = !state.busy && state.adbPath.isNotBlank(),
-        ) { Text("Capturer") }
+        ) { Text(strings.toolbarCapture) }
 
         OutlinedButton(onClick = { state.refreshDevices() }, enabled = !state.busy) {
-            Text("Actualiser devices")
+            Text(strings.toolbarRefreshDevices)
         }
 
         DeviceSelector(state)
+
+        CaptureActionsMenu(state)
 
         if (state.busy) {
             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -97,28 +103,119 @@ private fun Toolbar(state: AppState) {
         }
 
         TextButton(onClick = { state.screen = Screen.Explorer }) {
-            Text("Explorer")
+            Text(strings.toolbarExplorer)
+        }
+        TextButton(onClick = { state.screen = Screen.ManualExplorer }) {
+            Text(strings.manualToolbarLabel)
+        }
+        TextButton(onClick = { state.screen = Screen.Sessions }) {
+            Text(strings.toolbarSessions)
         }
         if (state.explorerSession != null) {
             TextButton(onClick = { state.screen = Screen.Graph }) {
-                Text("Graphe")
+                Text(strings.toolbarGraph)
             }
         }
         TextButton(onClick = { state.screen = Screen.Settings }) {
-            Text("Paramètres")
+            Text(strings.toolbarSettings)
         }
     }
 }
 
 @Composable
+private fun CaptureActionsMenu(state: AppState) {
+    val strings = LocalStrings.current
+    var open by remember { mutableStateOf(false) }
+    val hasCapture = state.screenshotPng != null && state.xmlText != null
+
+    Box {
+        OutlinedButton(onClick = { open = true }) {
+            Text(strings.captureActionsMenu + " ▾", maxLines = 1)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text(strings.captureActionImport) },
+                onClick = {
+                    open = false
+                    pickLoadFile(strings.captureImportDialogTitle, suggested = "*.zip")?.let {
+                        state.importCaptureFrom(it)
+                    }
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(strings.captureActionExport) },
+                enabled = hasCapture,
+                onClick = {
+                    open = false
+                    pickSaveFile(strings.captureExportDialogTitle, suggestedName = "capture.zip")?.let {
+                        state.exportCaptureTo(it)
+                    }
+                },
+            )
+            androidx.compose.material3.HorizontalDivider()
+            DropdownMenuItem(
+                text = { Text(strings.captureActionCopyImage) },
+                enabled = hasCapture,
+                onClick = { open = false; state.copyScreenshotToClipboard() },
+            )
+            DropdownMenuItem(
+                text = { Text(strings.captureActionCopyXml) },
+                enabled = hasCapture,
+                onClick = { open = false; state.copyXmlToClipboard() },
+            )
+            androidx.compose.material3.HorizontalDivider()
+            DropdownMenuItem(
+                text = { Text(strings.captureActionSaveImage) },
+                enabled = hasCapture,
+                onClick = {
+                    open = false
+                    pickSaveFile(strings.captureSaveImageDialogTitle, suggestedName = "screenshot.png")?.let {
+                        state.saveScreenshotTo(it)
+                    }
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(strings.captureActionSaveXml) },
+                enabled = hasCapture,
+                onClick = {
+                    open = false
+                    pickSaveFile(strings.captureSaveXmlDialogTitle, suggestedName = "dump.xml")?.let {
+                        state.saveXmlTo(it)
+                    }
+                },
+            )
+        }
+    }
+}
+
+private fun pickSaveFile(title: String, suggestedName: String): java.io.File? {
+    val dialog = java.awt.FileDialog(null as java.awt.Frame?, title, java.awt.FileDialog.SAVE)
+    dialog.file = suggestedName
+    dialog.isVisible = true
+    val dir = dialog.directory ?: return null
+    val file = dialog.file ?: return null
+    return java.io.File(dir, file)
+}
+
+private fun pickLoadFile(title: String, suggested: String): java.io.File? {
+    val dialog = java.awt.FileDialog(null as java.awt.Frame?, title, java.awt.FileDialog.LOAD)
+    dialog.file = suggested
+    dialog.isVisible = true
+    val dir = dialog.directory ?: return null
+    val file = dialog.file ?: return null
+    return java.io.File(dir, file)
+}
+
+@Composable
 private fun DeviceSelector(state: AppState) {
+    val strings = LocalStrings.current
     var open by remember { mutableStateOf(false) }
     val selected = state.devices.firstOrNull { it.serial == state.selectedSerial }
     val label = when {
         selected != null -> selected.displayName
         state.selectedSerial != null -> state.selectedSerial!!
-        state.devices.isEmpty() -> "Aucun device"
-        else -> "Choisir un device"
+        state.devices.isEmpty() -> strings.toolbarNoDevice
+        else -> strings.toolbarChooseDevice
     }
     Box {
         OutlinedButton(onClick = { open = true }, enabled = !state.busy) {
@@ -126,7 +223,7 @@ private fun DeviceSelector(state: AppState) {
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             if (state.devices.isEmpty()) {
-                DropdownMenuItem(text = { Text("Aucun device") }, onClick = { open = false })
+                DropdownMenuItem(text = { Text(strings.toolbarNoDevice) }, onClick = { open = false })
             } else {
                 state.devices.forEach { d ->
                     DropdownMenuItem(

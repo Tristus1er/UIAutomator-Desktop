@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<hierarchy rotation="0">
+  <!--
+    Stock Android permission dialog as served by uiautomator dump. The whole
+    overlay is hosted by `com.android.permissioncontroller`; the explorer
+    detects the dialog via the dominant package and tries to dismiss it by
+    finding a clickable whose text matches "Allow"/"While using the app"/
+    "Only this time". The Don't Allow button is included to verify the
+    matcher prefers the most permissive option.
+  -->
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.android.permissioncontroller" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][1080,2400]">
+    <node index="0" text="Allow MyApp to access this device's location?" resource-id="com.android.permissioncontroller:id/permission_message" class="android.widget.TextView" package="com.android.permissioncontroller" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[60,400][1020,600]"/>
+    <node index="1" text="Allow only while using the app" resource-id="com.android.permissioncontroller:id/permission_allow_foreground_only_button" class="android.widget.Button" package="com.android.permissioncontroller" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[120,1700][960,1800]"/>
+    <node index="2" text="Only this time" resource-id="com.android.permissioncontroller:id/permission_allow_one_time_button" class="android.widget.Button" package="com.android.permissioncontroller" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[120,1820][960,1920]"/>
+    <node index="3" text="Don&apos;t allow" resource-id="com.android.permissioncontroller:id/permission_deny_button" class="android.widget.Button" package="com.android.permissioncontroller" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[120,1940][960,2040]"/>
+  </node>
+</hierarchy>

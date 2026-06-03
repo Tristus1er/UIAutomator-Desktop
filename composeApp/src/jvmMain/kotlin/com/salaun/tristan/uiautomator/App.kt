@@ -5,15 +5,20 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
+import com.salaun.tristan.uiautomator.i18n.LocalStrings
+import com.salaun.tristan.uiautomator.i18n.Translations
 import com.salaun.tristan.uiautomator.settings.AppSettings
 import com.salaun.tristan.uiautomator.ui.ExplorerScreen
 import com.salaun.tristan.uiautomator.ui.GraphScreen
 import com.salaun.tristan.uiautomator.ui.MainScreen
+import com.salaun.tristan.uiautomator.ui.ManualExplorerScreen
+import com.salaun.tristan.uiautomator.ui.SessionsScreen
 import com.salaun.tristan.uiautomator.ui.SettingsScreen
 
 @Composable
@@ -26,13 +31,17 @@ fun App() {
 
         LaunchedEffect(Unit) { state.initialize() }
 
-        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                when (state.screen) {
-                    Screen.Main -> MainScreen(state)
-                    Screen.Settings -> SettingsScreen(state)
-                    Screen.Explorer -> ExplorerScreen(state)
-                    Screen.Graph -> GraphScreen(state)
+        CompositionLocalProvider(LocalStrings provides Translations.of(state.currentLanguage)) {
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    when (state.screen) {
+                        Screen.Main -> MainScreen(state)
+                        Screen.Settings -> SettingsScreen(state)
+                        Screen.Explorer -> ExplorerScreen(state)
+                        Screen.ManualExplorer -> ManualExplorerScreen(state)
+                        Screen.Graph -> GraphScreen(state)
+                        Screen.Sessions -> SessionsScreen(state)
+                    }
                 }
             }
         }

@@ -1,11 +1,11 @@
 package com.salaun.tristan.uiautomator.explorer
 
-import com.salaun.tristan.uiautomator.adb.AdbService
+import com.salaun.tristan.uiautomator.adb.AdbGateway
 import com.salaun.tristan.uiautomator.model.DumpParser
 import com.salaun.tristan.uiautomator.model.UiNode
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -19,8 +19,46 @@ data class ExplorerProgress(
     val currentActionLabel: String?,
 )
 
+/**
+ * Iterative breadth-first crawler.
+ *
+ * Each state's clickables are exercised in one pass, with a BACK between
+ * siblings to keep the device on the source. Newly-discovered child states
+ * are pushed onto a FIFO queue so the explorer fans out across siblings of
+ * the root before diving into descendants — this prevents one greedy branch
+ * (a NumberPicker, a multi-page wizard) from exhausting the state budget
+ * before the user's other entry points are even visited.
+ *
+ * Three exception paths short-circuit the naive "tap and capture" loop:
+ *  - **Wheel pickers** (NumberPicker / DatePicker / TimePicker): every
+ *    visible cell is collapsed into a single self-loop without an actual
+ *    tap, because by construction those widgets cycle their visible labels
+ *    rather than navigating away. A 24-cell hour picker now consumes one
+ *    transition instead of 24 spurious states.
+ *  - **System permission dialogs**: a screen on
+ *    `com.android.permissioncontroller` (or its Google variant) — whether it
+ *    appears at launch, after a tap, or after a BACK — is auto-granted by
+ *    clicking the most permissive Allow-style button (never a deny button,
+ *    even though "Don't allow" contains the substring "allow"). The dialog
+ *    itself is registered as a captured state and the grant recorded as a
+ *    transition, so the permission is visible in the session; the crawler
+ *    then continues against the screen behind the gate instead of recording
+ *    `leftApp` and giving up.
+ *  - **Picker-like selection changes**: when the post-tap screen has the
+ *    same structure fingerprint as the source and the click came from a
+ *    sibling group of [pickerSiblingThreshold]+ cells, we record a
+ *    self-loop and remember the post-tap fingerprint as still-pointing-at
+ *    the source so that future captures don't trigger an expensive
+ *    relaunch+replay recovery.
+ *
+ * Drifts (BACK landing us on an unexpected screen, taps leaving the target
+ * package without going through a permission dialog, capture failures) are
+ * handled by relaunching the app and replaying the path that originally
+ * led to the desired source state. A trailing fix-up pass re-attempts every
+ * state still holding unexercised clickables once more before quitting.
+ */
 class Explorer(
-    private val adb: AdbService,
+    private val adb: AdbGateway,
     private val serial: String?,
     private val config: ExplorationConfig,
     private val store: SessionStore,
@@ -32,129 +70,1018 @@ class Explorer(
         fun onSessionUpdated(session: ExplorationSession)
     }
 
-    private data class Task(val stateId: String, val path: List<ClickableRef>)
-    private data class Snapshot(val png: ByteArray, val xml: String, val root: UiNode, val pkg: String, val fingerprint: String)
+    private data class Snapshot(
+        val png: ByteArray,
+        val xml: String,
+        val root: UiNode,
+        val pkg: String,
+        val fingerprint: String,
+    )
 
-    suspend fun run(listener: Listener): ExplorationSession = coroutineScope {
-        val session = ExplorationSession(
+    private lateinit var session: ExplorationSession
+    private lateinit var listener: Listener
+    private val fingerprintToId = HashMap<String, String>()
+    /**
+     * Per-state structure fingerprint (text-free SHA-1 of the DOM). Used to
+     * recognise "the same logical screen with a different selection" after a
+     * tap on a picker / list / grid cell — see [isSelectionWithinSameScreen].
+     */
+    private val structureFingerprintByStateId = HashMap<String, String>()
+    private var processed = 0
+    private var planned = 0
+
+    /**
+     * Id of the app's actual root state (the first non-permission screen).
+     * Not necessarily `session.states.first()`: a permission prompt fired at
+     * launch is captured as its own state ahead of the root, so recovery /
+     * path-replay must anchor on this explicit id rather than on index 0.
+     */
+    private var rootStateId: String? = null
+
+    /**
+     * Threshold above which a tapped clickable's sibling group is considered
+     * "list-like" (a picker, grid, or long radio group) rather than a plain
+     * action button row. Below this, structure-only matches are ignored to
+     * avoid mistaking a wizard's "Next" button or a 3-tab bar for a picker.
+     *
+     * Lowered from 5 → 3 so wheel-style pickers — which only expose three
+     * visible siblings (decrement/value/increment) — also collapse into
+     * self-loops via the same [isSelectionWithinSameScreen] heuristic. The
+     * dedicated [insideWheelPicker] short-circuit catches the common
+     * NumberPicker/DatePicker/TimePicker case earlier; this threshold
+     * remains the safety net for OEM widgets that render a wheel without
+     * inheriting from the standard classes.
+     */
+    private val pickerSiblingThreshold = 3
+
+    suspend fun run(listener: Listener): ExplorationSession {
+        this.listener = listener
+        session = ExplorationSession(
             id = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date()),
             targetPackage = config.targetPackage,
             startedAt = System.currentTimeMillis(),
             config = config,
         )
-        var processed = 0
-        var planned = 0
-        val fingerprintToId = HashMap<String, String>()
+        listener.onLog("Session: ${store.baseDir.absolutePath}")
 
-        fun persist() {
-            store.save(session)
-            listener.onSessionUpdated(session)
-        }
-
-        fun emit(stateId: String?, action: String?) {
-            listener.onProgress(
-                ExplorerProgress(
-                    discoveredStates = session.states.size,
-                    processedActions = processed,
-                    plannedActions = planned,
-                    currentStateId = stateId,
-                    currentActionLabel = action,
-                )
+        // Freeze the system status bar BEFORE the first capture so the very
+        // first fingerprint already reflects a stable clock / battery / signal.
+        // Otherwise the explorer would naturally re-encounter "the same screen
+        // but with the clock advanced one minute" and register it as a new
+        // state. This is best-effort: on locked-down OEM builds the broadcast
+        // is rejected, in which case we fall back on the systemui filter
+        // applied inside `StateOps.fingerprint`.
+        val demoOn = runCatching { adb.enterDemoMode(serial) }.getOrDefault(false)
+        if (demoOn) {
+            listener.onLog("✓ SystemUI demo mode enabled (clock/battery/signal frozen)")
+        } else {
+            listener.onLog(
+                "⚠ Could not enable SystemUI demo mode — minor status-bar changes may " +
+                    "split duplicate states. To allow it: " +
+                    "`adb shell settings put global sysui_demo_allowed 1`"
             )
         }
 
-        listener.onLog("Session : ${store.baseDir.absolutePath}")
-        listener.onLog("Lancement de ${config.targetPackage}…")
-        adb.launchApp(serial, config.targetPackage)
-        delay(config.settleDelayMs + 500)
+        try {
+            listener.onLog("Launching ${config.targetPackage}…")
 
-        val rootSnap = capture()
-        if (rootSnap.pkg != config.targetPackage && config.targetPackage.isNotBlank()) {
-            listener.onLog("⚠ Package courant : « ${rootSnap.pkg} » — exploration interrompue.")
+            adb.launchApp(serial, config.targetPackage)
+            delay(config.settleDelayMs + 500)
+
+            var initial = capture()
+
+            // Many apps fire a permission prompt the moment they open. Resolve
+            // it before the package check so the crawler isn't aborted by a
+            // `com.android.permissioncontroller` top window — the dialog is
+            // captured as its own state and the auto-grant linked to the
+            // screen behind it once the root is registered below.
+            var launchGrant: GrantOutcome? = null
+            if (initial.pkg in StateOps.PERMISSION_PACKAGES) {
+                listener.onLog("⚠ Permission dialog on launch — auto-granting…")
+                launchGrant = grantPermissionChain(
+                    first = initial, incomingFrom = null, incomingAction = null, triggerPath = emptyList(),
+                )
+                if (launchGrant == null) {
+                    listener.onLog("⚠ Could not resolve the launch permission dialog. Aborted.")
+                    session.endedAt = System.currentTimeMillis()
+                    persist()
+                    return session
+                }
+                initial = launchGrant.behind
+            }
+
+            if (config.targetPackage.isNotBlank() && initial.pkg != config.targetPackage) {
+                listener.onLog("⚠ Top package is '${initial.pkg}', not '${config.targetPackage}'. Aborted.")
+                session.endedAt = System.currentTimeMillis()
+                persist()
+                return session
+            }
+
+            val root = registerState(initial, depth = 0, path = emptyList())
+            rootStateId = root.id
+            fingerprintToId[root.fingerprint] = root.id
+            // Link the last launch-permission dialog to the now-registered root.
+            launchGrant?.let { g ->
+                session.transitions += TransitionEntry(g.lastDialogId, root.id, g.lastAllowAction)
+            }
+            planned += root.clickables.size
+            listener.onLog("Initial state ${root.id} (${root.clickables.size} actions)")
+            emit(root.id, null)
+            persist()
+
+            // Context-preserving frontier exploration: keep the app running and
+            // walk it like a human until every flagged element on every
+            // discovered screen has been verified. No relaunch between actions
+            // (a relaunch would discard one-time onboarding context and strand
+            // everything behind it) — navigation between screens uses BACK and
+            // the app's own recorded edges.
+            frontierExplore(root)
+
+            val spine = detectOnboardingSpine()
+            if (spine.size >= 3) {
+                listener.onLog("🚀 Onboarding sequence (shown once, then never again): ${spine.joinToString(" → ")} (${spine.size} screens)")
+            }
+
             session.endedAt = System.currentTimeMillis()
             persist()
-            return@coroutineScope session
-        }
-
-        val s0 = registerState(session, rootSnap, depth = 0, path = emptyList())
-        fingerprintToId[s0.fingerprint] = s0.id
-        planned += s0.clickables.size
-        persist()
-        listener.onLog("État initial : ${s0.id} (${s0.clickables.size} actions)")
-
-        val queue = ArrayDeque<Task>()
-        queue += Task(s0.id, emptyList())
-
-        while (queue.isNotEmpty() && session.states.size < config.maxStates) {
-            coroutineContext.ensureActive()
-            val task = queue.removeFirst()
-            val source = session.states.first { it.id == task.stateId }
-            listener.onLog("▶ ${source.id} — ${source.clickables.size} actions, profondeur ${source.depth}")
-
-            for (click in source.clickables) {
-                coroutineContext.ensureActive()
-                val already = session.transitions.any { t ->
-                    t.from == source.id && t.action.bounds == click.bounds && t.action.resourceId == click.resourceId
-                }
-                if (already) { processed++; emit(source.id, click.label); continue }
-
-                if (!reachState(source, task.path)) {
-                    listener.onLog("  ✘ Impossible de rejoindre ${source.id}, action ignorée.")
-                    processed++; emit(source.id, click.label); continue
-                }
-
-                listener.onLog("  • tap « ${click.label} » @(${click.tapX},${click.tapY})")
-                adb.inputTap(serial, click.tapX, click.tapY)
-                delay(config.settleDelayMs)
-
-                val after = capture()
-                if (after.pkg != config.targetPackage) {
-                    listener.onLog("    → sortie vers ${after.pkg}, BACK")
-                    session.transitions += TransitionEntry(source.id, null, click, leftApp = true)
-                    runCatching { adb.pressBack(serial) }
-                    delay(config.settleDelayMs)
-                    processed++; emit(source.id, click.label); persist(); continue
-                }
-
-                val knownId = fingerprintToId[after.fingerprint]
-                if (knownId != null) {
-                    val loop = knownId == source.id
-                    listener.onLog("    → état connu ${knownId}${if (loop) " (boucle)" else ""}")
-                    session.transitions += TransitionEntry(source.id, knownId, click, loop = loop)
-                } else {
-                    val newDepth = source.depth + 1
-                    val newState = registerState(session, after, depth = newDepth, path = task.path + click)
-                    fingerprintToId[after.fingerprint] = newState.id
-                    planned += newState.clickables.size
-                    session.transitions += TransitionEntry(source.id, newState.id, click)
-                    listener.onLog("    → nouvel état ${newState.id} (${newState.clickables.size} actions)")
-                    if (newDepth < config.maxDepth && session.states.size < config.maxStates) {
-                        queue += Task(newState.id, task.path + click)
-                    }
-                }
-                processed++
-                emit(source.id, click.label)
-                persist()
+            listener.onLog("Exploration done: ${session.states.size} states, ${session.transitions.size} transitions.")
+            return session
+        } finally {
+            // Always restore the live status bar, even on cancellation/exception,
+            // otherwise the user is stuck with a frozen clock until they reboot.
+            if (demoOn) {
+                runCatching { adb.exitDemoMode(serial) }
+                listener.onLog("✓ SystemUI demo mode disabled")
             }
         }
+    }
 
-        session.endedAt = System.currentTimeMillis()
-        persist()
-        listener.onLog("Exploration terminée : ${session.states.size} états, ${session.transitions.size} transitions.")
-        session
+    /**
+     * Where a single BACK press leads, learned per state. Seeded optimistically
+     * when we enter a fresh child (BACK from it should return to its parent) and
+     * corrected whenever a real BACK lands somewhere else. The navigation graph
+     * uses these as "up" edges so the crawler can climb back to a frontier
+     * screen without relaunching.
+     */
+    private val backLeadsTo = HashMap<String, String>()
+
+    /** States whose text fields were filled / scrollable content harvested already. */
+    private val preparedStates = HashSet<String>()
+
+    /**
+     * States we have given up reaching from the live context (navigation and a
+     * last-resort relaunch both failed). Their remaining clickables stay
+     * unexercised but the frontier loop no longer selects them, so it
+     * terminates instead of spinning on an unreachable screen.
+     */
+    private val exhaustedStates = HashSet<String>()
+
+    /** A single navigation move: a recorded forward tap, or a BACK press. */
+    private sealed class NavStep {
+        abstract val from: String
+        abstract val to: String
+        data class Forward(override val from: String, override val to: String, val action: ClickableRef) : NavStep()
+        data class Back(override val from: String, override val to: String) : NavStep()
+    }
+
+    /**
+     * Context-preserving frontier exploration. Keeps the app running and walks
+     * it like a human: exercise an unflagged element on the current screen,
+     * follow wherever it leads, and only when the current screen is exhausted
+     * navigate — via BACK and the app's own recorded edges — to the nearest
+     * screen that still has work. Loops until every flagged element on every
+     * discovered screen has been verified (or the state cap is hit).
+     */
+    private suspend fun frontierExplore(root: StateEntry) {
+        var current: StateEntry = root
+        while (coroutineContext.isActive && session.states.size < config.maxStates) {
+            current = session.states.firstOrNull { it.id == current.id } ?: current
+
+            // 1. Anything left to try on the current screen?
+            if (current.id !in exhaustedStates && branchDepth(current.id) < config.maxDepth) {
+                prepareStateForExploration(current)
+                current = session.states.firstOrNull { it.id == current.id } ?: current
+                val click = current.clickables.firstOrNull { !isExercised(current, it) }
+                if (click != null) {
+                    val landed = exerciseClickable(current, click)
+                    current = landed ?: reanchor() ?: relaunchToRoot() ?: break
+                    continue
+                }
+            }
+
+            // 2. Current screen exhausted → navigate to the nearest screen with
+            //    unflagged elements. When none remain anywhere, we're done.
+            val target = nearestFrontier(current) ?: break
+            val reached = navigateTo(current, target)
+            if (reached != null) {
+                current = reached
+            } else {
+                // The target can't be reached from the live context. Try a
+                // single relaunch + replay; if even that fails, abandon it so
+                // the loop can finish rather than spin.
+                val r = runCatching { recoverTo(target, target.pathFromRoot) }.getOrDefault(false)
+                if (r) {
+                    current = target
+                } else {
+                    listener.onLog("  ✘ ${target.id} unreachable from context — skipping its remaining elements")
+                    exhaustedStates += target.id
+                }
+            }
+        }
+    }
+
+    /**
+     * Identifies the onboarding spine: the maximal chain of screens from the
+     * root where each screen leads forward to exactly one next screen, i.e. the
+     * linear welcome / wizard flow the app shows once on first run and never
+     * again. It ends at the first screen that forks the navigation (the real
+     * "hub"). Purely informational — the frontier crawler already handles these
+     * screens correctly by consuming their single action on the way down and
+     * never needing to replay them.
+     */
+    private fun detectOnboardingSpine(): List<String> {
+        val root = rootStateId ?: return emptyList()
+        val forward = HashMap<String, MutableSet<String>>()
+        for (t in session.transitions) {
+            val to = t.to
+            if (to != null && !t.loop && !t.leftApp && t.errorMessage == null && to != t.from) {
+                forward.getOrPut(t.from) { HashSet() }.add(to)
+            }
+        }
+        val spine = ArrayList<String>()
+        val seen = HashSet<String>()
+        var cur = root
+        while (seen.add(cur)) {
+            spine += cur
+            val nexts = forward[cur] ?: break
+            if (nexts.size != 1) break // branch point — onboarding ends here
+            cur = nexts.first()
+        }
+        return spine
+    }
+
+    /** `true` when [s] still has unflagged, in-budget clickables worth visiting. */
+    private fun hasWork(s: StateEntry): Boolean =
+        s.id !in exhaustedStates &&
+            branchDepth(s.id) < config.maxDepth &&
+            s.clickables.any { !isExercised(s, it) }
+
+    /**
+     * One-time per state: fill empty text fields and harvest off-screen
+     * clickables by scrolling, so the frontier reflects everything reachable on
+     * the screen before we start tapping. The device must already be on [state].
+     */
+    private suspend fun prepareStateForExploration(state: StateEntry) {
+        if (!preparedStates.add(state.id)) return
+        fillTextFieldsOn(state)
+        val harvested = harvestScrolledClickables(state)
+        if (harvested.isNotEmpty()) {
+            val idx = session.states.indexOfFirst { it.id == state.id }
+            if (idx >= 0) {
+                session.states[idx] = session.states[idx].copy(
+                    clickables = session.states[idx].clickables + harvested,
+                )
+            }
+            planned += harvested.size
+            persist()
+        }
+    }
+
+    /**
+     * Breadth-first search over the navigation graph (recorded forward edges +
+     * learned BACK edges) for the nearest reachable screen that still has work.
+     * Falls back to the lowest-id frontier state when none is reachable from the
+     * live context, so the caller can attempt a last-resort relaunch.
+     */
+    private fun nearestFrontier(from: StateEntry): StateEntry? {
+        val byId = session.states.associateBy { it.id }
+        val frontier = session.states.filter { hasWork(it) }
+        if (frontier.isEmpty()) return null
+        val adj = navAdjacency()
+        val visited = HashSet<String>().apply { add(from.id) }
+        val queue = ArrayDeque<String>().apply { add(from.id) }
+        while (queue.isNotEmpty()) {
+            val u = queue.removeFirst()
+            val st = byId[u]
+            if (st != null && st.id != from.id && hasWork(st)) return st
+            for (v in adj[u].orEmpty()) if (visited.add(v)) queue += v
+        }
+        return frontier.minByOrNull { it.id }
+    }
+
+    /** Forward (recorded) + BACK (learned) adjacency for navigation BFS. */
+    private fun navAdjacency(): Map<String, Set<String>> {
+        val adj = HashMap<String, MutableSet<String>>()
+        for (t in session.transitions) {
+            val to = t.to
+            if (to != null && !t.loop && !t.leftApp && t.errorMessage == null && to != t.from) {
+                adj.getOrPut(t.from) { HashSet() }.add(to)
+            }
+        }
+        for ((f, to) in backLeadsTo) adj.getOrPut(f) { HashSet() }.add(to)
+        return adj
+    }
+
+    /**
+     * Drives the device from [from] to [target] along a shortest navigation
+     * path, verifying the landing after every move and learning BACK edges as
+     * it goes. Returns [target] on success, or `null` on drift / no known path
+     * (the caller then falls back to a relaunch).
+     */
+    private suspend fun navigateTo(from: StateEntry, target: StateEntry): StateEntry? {
+        if (from.id == target.id) return if (verifyOn(target)) target else null
+        val steps = navPath(from.id, target.id) ?: return null
+        listener.onLog("→ ${from.id} ⇒ ${target.id} via ${steps.size} step(s)")
+        for (step in steps) {
+            val ok = when (step) {
+                is NavStep.Forward -> {
+                    if (step.action.scrollToReveal > 0) scrollDownTimes(step.action.scrollToReveal)
+                    runCatching { adb.inputTap(serial, step.action.tapX, step.action.tapY) }
+                    delay(config.settleDelayMs)
+                    val snap = runCatching { capture() }.getOrNull() ?: return null
+                    fingerprintToId[snap.fingerprint] == step.to
+                }
+                // BACK may take more than one press to climb past an interstitial
+                // (a confirmation overlay, an IME, a transient screen the app
+                // pops on its own). Retry a few times, learning where BACK
+                // actually lands, before declaring drift — this is what keeps a
+                // sibling reachable without a context-destroying relaunch.
+                is NavStep.Back -> climbBackTo(step)
+            }
+            if (!ok) {
+                listener.onLog("  ✘ nav drift heading for ${step.to}")
+                return null
+            }
+        }
+        return if (verifyOn(target)) target else null
+    }
+
+    /** Presses BACK up to [BACK_RECOVERY_ATTEMPTS] times trying to land on [step].to. */
+    private suspend fun climbBackTo(step: NavStep.Back): Boolean {
+        repeat(BACK_RECOVERY_ATTEMPTS) {
+            runCatching { adb.pressBack(serial) }
+            delay(config.settleDelayMs)
+            val snap = runCatching { capture() }.getOrNull() ?: return false
+            val landed = fingerprintToId[snap.fingerprint]
+            if (landed != null) backLeadsTo[step.from] = landed
+            if (landed == step.to) return true
+            // Landed on a *different* known state: BACK overshot the target;
+            // further presses will only move farther away.
+            if (landed != null) return false
+        }
+        return false
+    }
+
+    /** Shortest navigation path [from]→[target], or `null` when none is known. */
+    private fun navPath(from: String, target: String): List<NavStep>? {
+        val adj = HashMap<String, MutableList<NavStep>>()
+        for (t in session.transitions) {
+            val to = t.to
+            if (to != null && !t.loop && !t.leftApp && t.errorMessage == null && to != t.from) {
+                adj.getOrPut(t.from) { mutableListOf() } += NavStep.Forward(t.from, to, t.action)
+            }
+        }
+        for ((f, to) in backLeadsTo) adj.getOrPut(f) { mutableListOf() } += NavStep.Back(f, to)
+
+        val prev = HashMap<String, NavStep>()
+        val visited = HashSet<String>().apply { add(from) }
+        val queue = ArrayDeque<String>().apply { add(from) }
+        while (queue.isNotEmpty()) {
+            val u = queue.removeFirst()
+            if (u == target) break
+            for (step in adj[u].orEmpty()) if (visited.add(step.to)) { prev[step.to] = step; queue += step.to }
+        }
+        if (target !in visited) return null
+        val path = ArrayList<NavStep>()
+        var cur = target
+        while (cur != from) {
+            val step = prev[cur] ?: return null
+            path += step
+            cur = step.from
+        }
+        path.reverse()
+        return path
+    }
+
+    /** Capture the current screen and return the known state it maps to, if any. */
+    private suspend fun reanchor(): StateEntry? {
+        val snap = runCatching { capture() }.getOrNull() ?: return null
+        val id = fingerprintToId[snap.fingerprint] ?: return null
+        return session.states.firstOrNull { it.id == id }
+    }
+
+    /** Last resort when the live context is lost entirely: relaunch and attach. */
+    private suspend fun relaunchToRoot(): StateEntry? = runCatching {
+        adb.launchApp(serial, config.targetPackage)
+        waitForKnownState()
+    }.getOrNull()
+
+    /**
+     * Taps a single [click] on [source] and returns the state the device ends
+     * up on afterwards (which may be [source] itself for a self-loop, a fresh
+     * child, or a previously-known screen we are now physically on). Returns
+     * `null` when the action threw and left us on an unknown screen — the
+     * caller re-anchors. Unlike the old BFS loop this never presses BACK to
+     * "return to source": staying wherever we landed is what preserves context
+     * and lets the crawl keep diving.
+     */
+    private suspend fun exerciseClickable(source: StateEntry, click: ClickableRef): StateEntry? {
+        if (session.states.size >= config.maxStates) return source
+
+        // Wheel-picker children only rotate labels — record a synthetic
+        // self-loop without an actual tap so the picker doesn't drift.
+        if (click.insideWheelPicker) {
+            listener.onLog("  ↺ wheel-picker click « ${click.label} » (synthetic self-loop)")
+            session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+            countProcessed(source.id, click.label); persist()
+            return source
+        }
+
+        listener.onLog(
+            "▶ ${source.id} · tap « ${click.label} »" +
+                if (click.scrollToReveal > 0) " (scroll ${click.scrollToReveal})" else "",
+        )
+        val after: Snapshot
+        try {
+            if (click.scrollToReveal > 0) scrollDownTimes(click.scrollToReveal)
+            adb.inputTap(serial, click.tapX, click.tapY)
+            delay(config.settleDelayMs)
+            after = capture()
+        } catch (e: Exception) {
+            val reason = e.message ?: e::class.simpleName.orEmpty()
+            listener.onLog("  ✘ « ${click.label} » failed: $reason")
+            session.transitions += TransitionEntry(source.id, null, click, errorMessage = reason)
+            countProcessed(source.id, click.label); persist()
+            return null
+        }
+
+        // System permission dialog: capture + auto-grant; continue on the
+        // screen behind the gate.
+        if (after.pkg in StateOps.PERMISSION_PACKAGES) {
+            val grant = grantPermissionChain(after, source, click, source.pathFromRoot + click)
+            countProcessed(source.id, click.label); persist()
+            if (grant == null) {
+                listener.onLog("  ⚠ permission dialog unresolved on ${after.pkg}")
+                return reanchor() ?: source
+            }
+            listener.onLog("  🔓 auto-granted permission(s) → behind ${grant.behind.pkg}")
+            return classifyBehindPermission(source, click, grant) ?: reanchor() ?: source
+        }
+
+        // Left the target app: record it, step back in, and continue from
+        // wherever that lands.
+        if (config.targetPackage.isNotBlank() && after.pkg != config.targetPackage) {
+            listener.onLog("  ⇗ left app (${after.pkg}), BACK")
+            session.transitions += TransitionEntry(source.id, null, click, leftApp = true)
+            countProcessed(source.id, click.label); persist()
+            runCatching { adb.pressBack(serial) }
+            delay(config.settleDelayMs)
+            return reanchor() ?: source
+        }
+
+        val knownId = fingerprintToId[after.fingerprint]
+        val result: StateEntry = when {
+            knownId == source.id -> {
+                listener.onLog("  ↺ self-loop")
+                session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+                source
+            }
+            knownId != null -> {
+                listener.onLog("  → known state $knownId")
+                session.transitions += TransitionEntry(source.id, knownId, click, loop = false)
+                session.states.firstOrNull { it.id == knownId } ?: source
+            }
+            isSelectionWithinSameScreen(source, click, after) -> {
+                listener.onLog("  ↺ same screen — selection in a list/picker (group=${click.siblingGroupSize})")
+                session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+                fingerprintToId[after.fingerprint] = source.id
+                source
+            }
+            else -> {
+                val child = registerState(after, depth = source.depth + 1, path = source.pathFromRoot + click)
+                fingerprintToId[after.fingerprint] = child.id
+                session.transitions += TransitionEntry(source.id, child.id, click)
+                backLeadsTo[child.id] = source.id
+                listener.onLog("  → new ${child.id} (${child.clickables.size} actions)")
+                child
+            }
+        }
+        countProcessed(source.id, click.label); persist()
+        return result
+    }
+
+    /**
+     * Outcome of a resolved permission chain: the [behind] snapshot is the
+     * first non-permission screen reached, [lastDialogId] the state id of the
+     * dialog that granted access to it, and [lastAllowAction] the button that
+     * was tapped — so the caller can record `lastDialog --Allow--> behind`.
+     */
+    private data class GrantOutcome(
+        val behind: Snapshot,
+        val lastDialogId: String,
+        val lastAllowAction: ClickableRef,
+    )
+
+    /**
+     * Drives a (possibly multi-round) system permission dialog to completion,
+     * always tapping the most permissive Allow-style affordance. Every
+     * distinct dialog screen is registered as its own captured state (so the
+     * permission shows up in the session graph) and each auto-Allow tap is
+     * recorded as a transition between consecutive dialogs.
+     *
+     * [incomingFrom] / [incomingAction] wire the *first* dialog to whatever
+     * triggered the permission (the source state and the tap on it). At app
+     * launch both are `null` — the first dialog simply becomes a registered
+     * state with no incoming edge yet (the caller links it to the root once
+     * that is registered).
+     *
+     * Returns the [GrantOutcome] for the screen behind the last gate, or
+     * `null` when an Allow button could not be located or the dialog outlived
+     * the [PERMISSION_FLOW_MAX_STEPS] budget — in which case the dialog state(s)
+     * already captured remain, and the caller recovers to its source.
+     */
+    private suspend fun grantPermissionChain(
+        first: Snapshot,
+        incomingFrom: StateEntry?,
+        incomingAction: ClickableRef?,
+        triggerPath: List<ClickableRef>,
+    ): GrantOutcome? {
+        var current = first
+        var prevDialogId: String? = null
+        var prevAllow: ClickableRef? = null
+        repeat(PERMISSION_FLOW_MAX_STEPS) {
+            when {
+                // The screen behind the gate has been reached — done.
+                current.pkg !in StateOps.PERMISSION_PACKAGES &&
+                    current.pkg !in StateOps.PERMISSION_SETTINGS_PACKAGES -> {
+                    val did = prevDialogId
+                    val act = prevAllow
+                    return if (did != null && act != null) {
+                        GrantOutcome(behind = current, lastDialogId = did, lastAllowAction = act)
+                    } else {
+                        null
+                    }
+                }
+
+                // The permission flow bounced through the system Settings app
+                // (app-info / special-access deep link). Climb back out toward
+                // the target app; the Settings pages are navigation plumbing,
+                // not app states, so they are not recorded.
+                current.pkg in StateOps.PERMISSION_SETTINGS_PACKAGES -> {
+                    listener.onLog("  ↩ backing out of ${current.pkg} after grant")
+                    runCatching { adb.pressBack(serial) }
+                    delay(config.settleDelayMs)
+                    current = runCatching { capture() }.getOrElse { return null }
+                    return@repeat
+                }
+
+                // A permission dialog: capture it as a state and auto-grant.
+                else -> {
+                    val existingId = fingerprintToId[current.fingerprint]
+                    val dialog = if (existingId != null) {
+                        session.states.first { it.id == existingId }
+                    } else {
+                        registerPermissionDialogState(current, triggerPath).also {
+                            fingerprintToId[current.fingerprint] = it.id
+                        }
+                    }
+
+                    // Wire the incoming edge: source→firstDialog, then dialog→dialog.
+                    if (prevDialogId == null) {
+                        if (incomingFrom != null && incomingAction != null) {
+                            session.transitions += TransitionEntry(incomingFrom.id, dialog.id, incomingAction)
+                        }
+                    } else {
+                        session.transitions += TransitionEntry(prevDialogId, dialog.id, prevAllow!!)
+                    }
+                    persist()
+
+                    val node = StateOps.findPermissionAllowNode(current.root)
+                    if (node == null) {
+                        listener.onLog("  ⚠ no Allow button on permission dialog ${dialog.id}")
+                        return null
+                    }
+                    val allowAction = clickableFromNode(node)
+                    try {
+                        adb.inputTap(serial, allowAction.tapX, allowAction.tapY)
+                        delay(config.settleDelayMs)
+                        current = capture()
+                    } catch (e: Exception) {
+                        listener.onLog("  ⚠ auto-Allow failed: ${e.message ?: e::class.simpleName}")
+                        return null
+                    }
+                    prevDialogId = dialog.id
+                    prevAllow = allowAction
+                }
+            }
+        }
+        listener.onLog("  ⚠ permission flow unresolved after $PERMISSION_FLOW_MAX_STEPS steps")
+        return null
+    }
+
+    /**
+     * Classifies the screen reached behind a resolved permission gate and
+     * records the granting transition from [grant].lastDialogId. Returns the
+     * [StateEntry] the device is now on (a fresh child registered with the
+     * trigger-only path, or an already-known screen), or `null` when the grant
+     * left us off-app — so the frontier loop keeps diving from the right place.
+     */
+    private fun classifyBehindPermission(
+        source: StateEntry,
+        click: ClickableRef,
+        grant: GrantOutcome,
+    ): StateEntry? {
+        val behind = grant.behind
+        if (config.targetPackage.isNotBlank() && behind.pkg != config.targetPackage) {
+            listener.onLog("  ⇗ behind permission still off-app (${behind.pkg})")
+            session.transitions += TransitionEntry(grant.lastDialogId, null, grant.lastAllowAction, leftApp = true)
+            return null
+        }
+        val knownId = fingerprintToId[behind.fingerprint]
+        if (knownId != null) {
+            listener.onLog("  → behind permission → known state $knownId")
+            session.transitions += TransitionEntry(
+                grant.lastDialogId, knownId, grant.lastAllowAction, loop = knownId == grant.lastDialogId,
+            )
+            return session.states.firstOrNull { it.id == knownId }
+        }
+        val child = registerState(
+            snap = behind,
+            depth = source.depth + 1,
+            path = source.pathFromRoot + click,
+        )
+        fingerprintToId[behind.fingerprint] = child.id
+        session.transitions += TransitionEntry(grant.lastDialogId, child.id, grant.lastAllowAction)
+        backLeadsTo[child.id] = source.id
+        listener.onLog("  → new ${child.id} behind permission (${child.clickables.size} actions)")
+        emit(child.id, null)
+        return child
+    }
+
+    /**
+     * Registers a permission-dialog screenshot + dump as a terminal state.
+     * Its clickables are deliberately left empty: the only useful action on a
+     * permission dialog is the Allow we just exercised, so we don't want the
+     * BFS or fix-up pass trying to navigate its buttons as app screens (and
+     * the dialog never reappears once granted, so it couldn't be replayed
+     * anyway). The screenshot is what satisfies "present in the captures".
+     */
+    private fun registerPermissionDialogState(snap: Snapshot, path: List<ClickableRef>): StateEntry {
+        val id = "S${session.states.size}"
+        val screenshotPath = store.writeScreenshot(id, snap.png)
+        val xmlPath = store.writeXml(id, snap.xml)
+        val entry = StateEntry(
+            id = id,
+            fingerprint = snap.fingerprint,
+            packageName = snap.pkg,
+            depth = path.size,
+            screenshotPath = screenshotPath,
+            xmlPath = xmlPath,
+            clickables = emptyList(),
+            pathFromRoot = path,
+        )
+        session.states += entry
+        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        listener.onLog("  📋 captured permission dialog as $id")
+        return entry
+    }
+
+    /** Builds a [ClickableRef] from a permission button node for the graph. */
+    private fun clickableFromNode(n: UiNode): ClickableRef {
+        val b = n.bounds!!
+        return ClickableRef(
+            resourceId = n.resourceId,
+            className = n.className,
+            text = n.text,
+            contentDesc = n.contentDesc,
+            bounds = SerialBounds.from(b),
+            tapX = (b.left + b.right) / 2,
+            tapY = (b.top + b.bottom) / 2,
+        )
+    }
+
+    /**
+     * Replays a forward sequence of actions on the device. A step that was only
+     * reachable after scrolling ([ClickableRef.scrollToReveal] > 0) first
+     * scrolls the current screen's main scrollable container that many times so
+     * the element is back in view before the tap. Shared by [recoverTo] and
+     * [pressBackAndEnsure].
+     */
+    private suspend fun replaySteps(steps: List<ClickableRef>) {
+        for (step in steps) {
+            if (step.scrollToReveal > 0) scrollDownTimes(step.scrollToReveal)
+            adb.inputTap(serial, step.tapX, step.tapY)
+            delay(config.settleDelayMs)
+        }
+    }
+
+    /**
+     * Swipes the current screen's largest scrollable container upward [times]
+     * times (revealing content further down). Best-effort: a no-op when no
+     * scrollable container is present. Used both to re-reveal an off-screen
+     * clickable before replaying a tap and by the in-screen scroll harvest.
+     */
+    private suspend fun scrollDownTimes(times: Int) {
+        if (times <= 0) return
+        val snap = runCatching { capture() }.getOrNull() ?: return
+        val scrollable = ScrollCapture.findScrollable(snap.root) ?: return
+        val b = scrollable.bounds ?: return
+        val midX = (b.left + b.right) / 2
+        val travel = (b.height * 70) / 100
+        val centerY = (b.top + b.bottom) / 2
+        repeat(times) {
+            runCatching { adb.inputSwipe(serial, midX, centerY + travel / 2, midX, centerY - travel / 2, 350) }
+            delay(config.settleDelayMs)
+        }
+    }
+
+    /**
+     * Scrolls [source] (the screen the device is currently on) downward up to
+     * [ExplorationConfig.maxScrollFrames] times, collecting clickables that
+     * weren't visible at scroll 0. Each newly-found clickable is tagged with
+     * the number of scrolls that reveal it (its recorded bounds are its
+     * *revealed* on-screen position) so the explorer can scroll-then-tap it and
+     * replay it later. The device is returned to the top before this returns,
+     * leaving `source` exactly as the caller found it.
+     *
+     * Wheel pickers (NumberPicker/DatePicker/TimePicker) are skipped: they are
+     * `scrollable` too, but "scrolling" them only rotates labels — harvesting
+     * those would resurrect the very state explosion the wheel-picker
+     * short-circuit exists to prevent.
+     */
+    private suspend fun harvestScrolledClickables(source: StateEntry): List<ClickableRef> {
+        if (config.maxScrollFrames <= 0) return emptyList()
+        val first = runCatching { capture() }.getOrNull() ?: return emptyList()
+        val scrollable = ScrollCapture.findScrollable(first.root) ?: return emptyList()
+        if (StateOps.isInsideWheelPicker(scrollable)) return emptyList()
+        val b0 = scrollable.bounds ?: return emptyList()
+        val midX = (b0.left + b0.right) / 2
+        val travel = (b0.height * 70) / 100
+        val centerY = (b0.top + b0.bottom) / 2
+
+        // Don't re-add anything already exposed at scroll 0. Match on identity
+        // (class + id + copy), NOT bounds, since bounds shift as we scroll.
+        fun sig(c: ClickableRef) = "${c.className}|${c.resourceId}|${c.text}|${c.contentDesc}"
+        val seen = HashSet<String>().apply { source.clickables.forEach { add(sig(it)) } }
+
+        val harvested = ArrayList<ClickableRef>()
+        var prevFp = first.fingerprint
+        var steps = 0
+        while (steps < config.maxScrollFrames && session.states.size < config.maxStates) {
+            runCatching { adb.inputSwipe(serial, midX, centerY + travel / 2, midX, centerY - travel / 2, 350) }
+            delay(config.settleDelayMs)
+            val snap = runCatching { capture() }.getOrNull() ?: break
+            steps++
+            if (snap.fingerprint == prevFp) break // bottom reached — nothing new uncovered
+            prevFp = snap.fingerprint
+            val frameClicks = StateOps.collectClickables(snap.root, config.targetPackage, config.maxClickablesPerState)
+            for (c in frameClicks) {
+                val s = sig(c)
+                if (!seen.add(s)) continue
+                harvested += c.copy(scrollToReveal = steps)
+            }
+        }
+        // Restore the scroll position so siblings / recovery see `source` at top.
+        repeat(steps) {
+            runCatching { adb.inputSwipe(serial, midX, centerY - travel / 2, midX, centerY + travel / 2, 350) }
+            delay(config.settleDelayMs)
+        }
+        if (harvested.isNotEmpty()) {
+            listener.onLog("  ↕ scroll harvest on ${source.id}: +${harvested.size} off-screen clickable(s) over $steps step(s)")
+        }
+        return harvested
+    }
+
+    private suspend fun verifyOn(target: StateEntry): Boolean {
+        val s = runCatching { capture() }.getOrNull() ?: return false
+        if (s.fingerprint == target.fingerprint) return true
+        // Fingerprints recorded as "still on this state" by selection-only
+        // taps (picker rotations etc.) live in [fingerprintToId] without
+        // appearing in the canonical `target.fingerprint` slot — accept
+        // them here so a wheel tap doesn't trigger a costly recovery.
+        return fingerprintToId[s.fingerprint] == target.id
+    }
+
+    /**
+     * Relaunches the app, waits for any known state to appear, and replays
+     * only the portion of [path] that still applies from that anchor point.
+     *
+     * This handles the onboarding case: when the first launch of the app
+     * showed a welcome flow (registered as `S0` … `Sn`), a subsequent launch
+     * typically skips it and lands directly on a later state (say `Sn+1`).
+     * Rather than give up because `S0` never reappears, we attach to the
+     * first known fingerprint we observe and replay only the suffix of the
+     * original click chain starting from that state. If the landed state
+     * isn't on the path to [target], the recovery fails and the caller will
+     * let the fix-up pass retry later.
+     */
+    private suspend fun recoverTo(target: StateEntry, path: List<ClickableRef>): Boolean {
+        listener.onLog("  ↻ recover → ${target.id} (relaunch + replay ${path.size} taps)")
+        return try {
+            adb.launchApp(serial, config.targetPackage)
+            val landed = waitForKnownState()
+            if (landed == null) {
+                listener.onLog("  ✘ no known state appeared after launch")
+                return false
+            }
+            val rootId = rootStateId
+            val suffix = if (landed.id == rootId) {
+                path
+            } else {
+                val skipped = pathSuffixFrom(landed.id, path) ?: run {
+                    listener.onLog("  ✘ landed on ${landed.id} but it's not on the path to ${target.id}")
+                    return false
+                }
+                listener.onLog("  ↳ attached to ${landed.id}, replaying ${skipped.size}/${path.size} tap(s)")
+                skipped
+            }
+            replaySteps(suffix)
+            val ok = verifyOn(target)
+            if (!ok) listener.onLog("  ✘ recovery landed on a different state")
+            ok
+        } catch (e: Exception) {
+            listener.onLog("  ✘ recovery threw: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Polls captures until any registered state's fingerprint appears, and
+     * returns that [StateEntry]. Returns `null` if no known state shows up
+     * within `maxAttempts` captures. Each iteration reuses [capture] (idle
+     * wait + XML dump) so a long splash screen is given room to finish.
+     *
+     * Match is widened beyond `state.fingerprint`: any fingerprint
+     * previously mapped to a state via [fingerprintToId] (e.g. a wheel
+     * picker rotation we deliberately collapsed onto the source) also
+     * counts as "you are on that state", so recovery after a picker tap
+     * does not insist on seeing the canonical fingerprint we first saw.
+     */
+    private suspend fun waitForKnownState(): StateEntry? {
+        val statesById = session.states.associateBy { it.id }
+        val maxAttempts = 5
+        for (attempt in 1..maxAttempts) {
+            val snap = runCatching { capture() }.getOrNull()
+            // A permission prompt fired by the relaunch (e.g. a previously
+            // "Only this time" grant re-asking) must be auto-allowed rather
+            // than mistaken for the screen we're waiting for — tap through it
+            // quietly (it was already captured on the first pass) and retry.
+            if (snap != null && snap.pkg in StateOps.PERMISSION_PACKAGES) {
+                val node = StateOps.findPermissionAllowNode(snap.root)
+                val b = node?.bounds
+                if (b != null) {
+                    listener.onLog("  🔓 auto-granting permission during recovery")
+                    runCatching { adb.inputTap(serial, (b.left + b.right) / 2, (b.top + b.bottom) / 2) }
+                    delay(config.settleDelayMs)
+                }
+                continue
+            }
+            val match = snap?.fingerprint?.let { fp ->
+                fingerprintToId[fp]?.let { id -> statesById[id] }
+            }
+            if (match != null) {
+                if (attempt > 1) listener.onLog("  ✓ ${match.id} reached after $attempt captures")
+                return match
+            }
+            val current = snap?.fingerprint?.take(8)
+            listener.onLog("  ⏳ waiting for a known state (seen fp=${current ?: "?"}…)")
+            delay(config.settleDelayMs)
+        }
+        return null
+    }
+
+    /**
+     * Walks the recorded forward transitions to find the suffix of [path]
+     * that begins *after* [landedId] is reached. Returns `null` when the
+     * landed state isn't on this particular path. Self-loops and error
+     * edges are ignored — we only follow forward transitions whose action
+     * matches the corresponding [ClickableRef] by resource id + bounds.
+     */
+    private fun pathSuffixFrom(landedId: String, path: List<ClickableRef>): List<ClickableRef>? {
+        val rootId = rootStateId ?: return null
+        if (landedId == rootId) return path
+        var current = rootId
+        for ((index, action) in path.withIndex()) {
+            val nextId = session.transitions.firstOrNull { t ->
+                t.from == current &&
+                    t.to != null &&
+                    !t.loop &&
+                    t.errorMessage == null &&
+                    t.action.resourceId == action.resourceId &&
+                    t.action.bounds == action.bounds
+            }?.to ?: return null
+            current = nextId
+            if (current == landedId) return path.subList(index + 1, path.size)
+        }
+        return null
+    }
+
+    /**
+     * "Branch depth" of a state: the number of *forks* on the shortest forward
+     * path from the root to it. A screen reached by walking a chain of
+     * single-exit screens (a wizard / onboarding) shares its predecessor's
+     * branch depth — only a source that offered more than one forward
+     * destination increments it. This keeps a long linear onboarding from
+     * eating the [ExplorationConfig.maxDepth] budget meant for the real feature
+     * tree, so "explore everything" isn't cut short three wizard steps in.
+     *
+     * Under-counting early (a source whose siblings aren't discovered yet looks
+     * linear) only ever errs toward exploring more; total work stays bounded by
+     * [ExplorationConfig.maxStates].
+     */
+    private fun branchDepth(stateId: String): Int {
+        val root = rootStateId ?: return 0
+        if (stateId == root) return 0
+        val forward = HashMap<String, MutableSet<String>>()
+        for (t in session.transitions) {
+            if (t.to == null || t.loop || t.leftApp || t.errorMessage != null) continue
+            if (t.to == t.from) continue
+            forward.getOrPut(t.from) { HashSet() }.add(t.to)
+        }
+        // BFS shortest path root → stateId, keeping parent pointers.
+        val parent = HashMap<String, String>()
+        val visited = HashSet<String>().apply { add(root) }
+        val queue = ArrayDeque<String>().apply { add(root) }
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            if (n == stateId) break
+            for (m in forward[n].orEmpty()) if (visited.add(m)) { parent[m] = n; queue += m }
+        }
+        if (stateId !in visited) return 0 // only reachable via a cross-edge — treat as shallow
+        var depth = 0
+        var cur = stateId
+        while (cur != root) {
+            val p = parent[cur] ?: break
+            if ((forward[p]?.size ?: 0) >= 2) depth++
+            cur = p
+        }
+        return depth
+    }
+
+    private fun isExercised(source: StateEntry, click: ClickableRef): Boolean =
+        session.transitions.any { t ->
+            t.from == source.id &&
+                t.action.resourceId == click.resourceId &&
+                t.action.bounds == click.bounds
+        }
+
+    /**
+     * Auto-fills empty editable fields on [source] (the screen the device is
+     * currently on) with [StateOps.defaultValueFor] values so input gates that
+     * block on empty fields can be walked through. Field geometry is read from
+     * the state's saved dump, which matches the live screen since the caller
+     * has just confirmed we're on it. Best-effort: failures are swallowed.
+     *
+     * Filling does not change the state's fingerprint — editable text is
+     * excluded from it (see [StateOps.fingerprint]) — so the filled form is
+     * still recognised as the same state on subsequent post-tap captures.
+     */
+    private suspend fun fillTextFieldsOn(source: StateEntry) {
+        if (!config.fillTextFields) return
+        val xml = runCatching {
+            java.io.File(store.baseDir, source.xmlPath).readText(Charsets.UTF_8)
+        }.getOrNull() ?: return
+        val root = DumpParser.parse(xml) ?: return
+        val fields = StateOps.collectEditableFields(root, config.targetPackage)
+            .filter { it.text.isBlank() }
+        if (fields.isEmpty()) return
+        listener.onLog("  ⌨ filling ${fields.size} empty text field(s) on ${source.id}")
+        for (f in fields) {
+            val b = f.bounds ?: continue
+            val value = StateOps.defaultValueFor(f)
+            runCatching {
+                adb.inputTap(serial, (b.left + b.right) / 2, (b.top + b.bottom) / 2)
+                delay(config.settleDelayMs)
+                adb.inputText(serial, value)
+                delay(config.settleDelayMs)
+            }.onFailure {
+                listener.onLog("  ⚠ could not fill « ${f.label} »: ${it.message ?: it::class.simpleName}")
+            }
+        }
     }
 
     private suspend fun capture(): Snapshot {
-        val png = adb.screenshotPng(serial)
+        // 1. Actively wait for the screen to stabilise, polling screenshots only.
+        //    This keeps us out of `uiautomator dump`'s "could not get idle state" trap:
+        //    we only fire the expensive dump *after* two consecutive screenshots
+        //    match (or after we reach the idle timeout).
+        val idle = waitForScreenIdle(
+            takeScreenshot = { adb.screenshotPng(serial) },
+            maxMs = config.idleMaxWaitMs,
+        )
+        if (!idle.stable) {
+            listener.onLog("  ⚠ screen not idle after ${config.idleMaxWaitMs}ms, dumping anyway")
+        } else if (idle.screenshotsTaken > 2) {
+            listener.onLog("  ⏳ waited ${idle.screenshotsTaken} polls for idle")
+        }
+        // 2. Now that the UI has settled (or we've given up), take the XML dump.
         val xml = adb.dumpUiXml(serial)
-        val root = DumpParser.parse(xml) ?: error("Dump XML invalide")
+        val root = DumpParser.parse(xml) ?: error("Invalid UIAutomator dump")
         val pkg = StateOps.dominantPackage(root)
-        val fp = StateOps.fingerprint(root)
-        return Snapshot(png, xml, root, pkg, fp)
+        return Snapshot(idle.png, xml, root, pkg, StateOps.fingerprint(root))
     }
 
     private fun registerState(
-        session: ExplorationSession,
         snap: Snapshot,
         depth: Int,
         path: List<ClickableRef>,
@@ -174,19 +1101,64 @@ class Explorer(
             pathFromRoot = path,
         )
         session.states += entry
+        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
         return entry
     }
 
-    private suspend fun reachState(source: StateEntry, path: List<ClickableRef>): Boolean {
-        if (config.relaunchBetweenActions) {
-            adb.launchApp(serial, config.targetPackage)
-            delay(config.settleDelayMs + 300)
-        }
-        for (step in path) {
-            adb.inputTap(serial, step.tapX, step.tapY)
-            delay(config.settleDelayMs)
-        }
-        val current = runCatching { capture() }.getOrNull() ?: return false
-        return current.fingerprint == source.fingerprint
+    /**
+     * Heuristic: the tap landed on what is structurally the same screen as
+     * `source`, just with a different cell highlighted. We only trust this
+     * when the tapped clickable was part of a sufficiently large sibling
+     * group ([pickerSiblingThreshold]+) — otherwise wizard "Next" buttons or
+     * small tab bars whose target screens happen to share the source's DOM
+     * skeleton would all collapse into self-loops, hiding real navigation.
+     */
+    private fun isSelectionWithinSameScreen(source: StateEntry, click: ClickableRef, after: Snapshot): Boolean {
+        if (click.siblingGroupSize < pickerSiblingThreshold) return false
+        val sourceStructure = structureFingerprintByStateId[source.id] ?: return false
+        return sourceStructure == StateOps.structureFingerprint(after.root)
+    }
+
+    private fun countProcessed(stateId: String, actionLabel: String) {
+        processed++
+        emit(stateId, actionLabel)
+    }
+
+    private fun emit(stateId: String?, actionLabel: String?) {
+        listener.onProgress(
+            ExplorerProgress(
+                discoveredStates = session.states.size,
+                processedActions = processed,
+                plannedActions = planned,
+                currentStateId = stateId,
+                currentActionLabel = actionLabel,
+            )
+        )
+    }
+
+    private fun persist() {
+        store.save(session)
+        listener.onSessionUpdated(session)
+    }
+
+    private companion object {
+        /**
+         * Hard cap on the number of steps the explorer takes while resolving a
+         * system permission flow — each step is either an Allow tap on a
+         * dialog or a BACK out of a Settings page the flow bounced through.
+         * Most permissions resolve in one or two steps; an app that deep-links
+         * into Settings and back may take a handful. Beyond this budget we
+         * assume the flow is stuck and bail out (the dialog states captured so
+         * far are kept; the caller recovers to its source).
+         */
+        const val PERMISSION_FLOW_MAX_STEPS = 8
+
+        /**
+         * How many BACK presses [pressBackAndEnsure] will try before paying for
+         * a full relaunch + replay. Covers a screen sitting two or three levels
+         * above the one we need to return to; beyond that a relaunch is more
+         * reliable than guessing.
+         */
+        const val BACK_RECOVERY_ATTEMPTS = 3
     }
 }

@@ -1,15 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(./gradlew.bat :composeApp:compileKotlinJvm --console=plain --no-daemon)",
-      "Bash(./gradlew.bat :composeApp:compileKotlinJvm --console=plain)",
-      "Bash(./gradlew.bat --stop)",
-      "Bash(adb version *)",
-      "Bash(adb devices *)",
-      "Bash(tasklist //FI \"IMAGENAME eq java.exe\")",
-      "Bash(tasklist //FI \"IMAGENAME eq javaw.exe\")",
-      "Bash(./gradlew.bat :composeApp:run --console=plain --no-daemon)",
-      "Bash(tee run.log)"
+      "PowerShell(*)",
+      "Bash(*)"
     ]
   }
 }

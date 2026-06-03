@@ -24,11 +24,19 @@ kotlin {
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
+            implementation(libs.compose.uiTest)
         }
         jvmMain.dependencies {
             implementation(compose.desktop.currentOs)
             implementation(libs.kotlinx.coroutinesSwing)
             implementation(libs.kotlinx.serializationJson)
+        }
+        jvmTest.dependencies {
+            implementation(libs.kotlin.testJunit)
+            implementation(libs.kotlin.reflect)
+            implementation(libs.junit)
+            implementation(libs.cucumber.java)
+            implementation(libs.cucumber.junit)
         }
     }
 }
