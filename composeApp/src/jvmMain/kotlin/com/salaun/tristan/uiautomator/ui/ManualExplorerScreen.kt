@@ -54,57 +54,28 @@ fun ManualExplorerScreen(state: AppState) {
     val scrollMode = state.manualScrollCapture != null
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Toolbar -----------------------------------------------------------
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(strings.manualTitle, style = MaterialTheme.typography.titleMedium)
-
-            if (!sessionStarted) {
-                Button(
-                    onClick = { state.startManualExploration() },
-                    enabled = !state.manualBusy && state.adbPath.isNotBlank(),
-                ) { Text(strings.manualStart) }
-            } else {
-                OutlinedButton(
-                    onClick = { state.manualPressBack() },
-                    enabled = !state.manualBusy,
-                ) { Text("◀ " + strings.manualBack) }
-                OutlinedButton(
-                    onClick = { state.manualRelaunch() },
-                    enabled = !state.manualBusy,
-                ) { Text("⌂ " + strings.manualHome) }
-                OutlinedButton(
-                    onClick = { state.manualRecapture() },
-                    enabled = !state.manualBusy,
-                ) { Text("⟳ " + strings.manualRefresh) }
-                if (scrollMode) {
-                    OutlinedButton(
-                        onClick = { state.manualExitScrollMode() },
-                        enabled = !state.manualBusy,
-                    ) { Text(strings.manualScrollExit) }
+        ScreenToolbar(
+            title = strings.manualTitle,
+            middle = {
+                if (!sessionStarted) {
+                    Button(
+                        onClick = { state.startManualExploration() },
+                        enabled = !state.manualBusy && state.adbPath.isNotBlank(),
+                    ) { Text(strings.manualStart) }
                 } else {
-                    OutlinedButton(
-                        onClick = { state.manualCaptureScrollable() },
-                        enabled = !state.manualBusy,
-                    ) { Text("↕ " + strings.manualScrollCapture) }
+                    OutlinedButton(onClick = { state.manualPressBack() }, enabled = !state.manualBusy) { Text("◀ " + strings.manualBack) }
+                    OutlinedButton(onClick = { state.manualRelaunch() }, enabled = !state.manualBusy) { Text("⌂ " + strings.manualHome) }
+                    OutlinedButton(onClick = { state.manualRecapture() }, enabled = !state.manualBusy) { Text("⟳ " + strings.manualRefresh) }
+                    if (scrollMode) {
+                        OutlinedButton(onClick = { state.manualExitScrollMode() }, enabled = !state.manualBusy) { Text(strings.manualScrollExit) }
+                    } else {
+                        OutlinedButton(onClick = { state.manualCaptureScrollable() }, enabled = !state.manualBusy) { Text("↕ " + strings.manualScrollCapture) }
+                    }
+                    Button(onClick = { state.endManualExploration() }, enabled = !state.manualBusy) { Text(strings.manualEnd) }
                 }
-                Button(
-                    onClick = { state.endManualExploration() },
-                    enabled = !state.manualBusy,
-                ) { Text(strings.manualEnd) }
-            }
-
-            if (state.manualBusy) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-            }
-
-            Box(modifier = Modifier.weight(1f)) {
+                if (state.manualBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                }
                 val sess = state.manualSession
                 val current = state.manualCurrentStateId
                 if (sess != null && current != null) {
@@ -115,12 +86,12 @@ fun ManualExplorerScreen(state: AppState) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-            }
-
-            TextButton(onClick = { state.screen = Screen.Main }) { Text(strings.home) }
-            TextButton(onClick = { state.screen = Screen.Sessions }) { Text(strings.toolbarSessions) }
-        }
-        HorizontalDivider()
+            },
+            nav = {
+                ToolbarNavButton(strings.home, onClick = { state.go(Screen.Main) })
+                ToolbarNavButton(strings.toolbarSessions, onClick = { state.go(Screen.Sessions) })
+            },
+        )
 
         // Body --------------------------------------------------------------
         Row(modifier = Modifier.fillMaxSize()) {

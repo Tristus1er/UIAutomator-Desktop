@@ -141,6 +141,41 @@ class GraphAutoLayoutTest {
     }
 
     @Test
+    fun `tiles snap onto shared rows or columns (alignment)`() {
+        // A small branching graph. After the alignment pass, nodes should share
+        // columns/rows rather than each sitting at its own jittered coordinate:
+        // at least one pair must be tightly aligned on x or y.
+        val nodes = (0..8).map { state("S$it") }
+        val edges = listOf(
+            edge("S0", "S1"), edge("S0", "S2"), edge("S1", "S3"), edge("S1", "S4"),
+            edge("S2", "S5"), edge("S2", "S6"), edge("S3", "S7"), edge("S5", "S8"),
+        )
+        val pos = layout(nodes, edges)
+        assertNoOverlap(pos)
+        val e = pos.values.toList()
+        var alignedPairs = 0
+        for (i in e.indices) for (j in i + 1 until e.size) {
+            if (abs(e[i].x - e[j].x) < 3f || abs(e[i].y - e[j].y) < 3f) alignedPairs++
+        }
+        assertTrue(alignedPairs > 0, "alignment pass should produce shared rows/columns, got $alignedPairs aligned pairs")
+    }
+
+    @Test
+    fun `the entry point S0 is anchored as the leftmost node`() {
+        val nodes = (0..7).map { state("S$it") }
+        val edges = listOf(
+            edge("S0", "S1"), edge("S1", "S2"), edge("S2", "S3"),
+            edge("S0", "S4"), edge("S4", "S5"), edge("S5", "S6"), edge("S6", "S7"),
+        )
+        val pos = layout(nodes, edges)
+        val s0x = pos["S0"]!!.x
+        assertTrue(
+            nodes.drop(1).all { pos[it.id]!!.x > s0x },
+            "S0 (the app entry point) must sit strictly left of every other tile",
+        )
+    }
+
+    @Test
     fun `self-loops and left-app transitions are ignored by the layout`() {
         val nodes = listOf(state("R"), state("A"), state("B"))
         val edges = listOf(

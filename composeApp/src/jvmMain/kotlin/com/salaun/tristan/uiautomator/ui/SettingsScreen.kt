@@ -35,58 +35,56 @@ fun SettingsScreen(state: AppState) {
     val strings = LocalStrings.current
     var draft by remember(state.adbPath) { mutableStateOf(state.adbPath) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        Text(strings.settingsTitle, style = MaterialTheme.typography.headlineSmall)
-
-        Text(
-            strings.settingsAdbPathHint,
-            style = MaterialTheme.typography.bodyMedium,
+    Column(modifier = Modifier.fillMaxSize()) {
+        ScreenToolbar(
+            title = strings.settingsTitle,
+            nav = { ToolbarNavButton(strings.home, onClick = { state.go(Screen.Main) }) },
         )
-
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            label = { Text(strings.settingsAdbPathLabel) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { state.applyAdbPath(draft) }) {
-                Text(strings.save)
-            }
-            OutlinedButton(onClick = { state.autoDetectAdb() }) {
-                Text(strings.settingsAutoDetect)
-            }
-            OutlinedButton(onClick = {
-                val picked = pickAdbBinary(strings.settingsPickAdbTitle)
-                if (picked != null) {
-                    draft = picked
-                    state.applyAdbPath(picked)
-                }
-            }) {
-                Text(strings.browse)
-            }
-        }
-
-        if (state.adbPathStatus.isNotBlank()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
             Text(
-                "${strings.settingsStatusPrefix}${state.adbPathStatus}",
-                style = MaterialTheme.typography.bodySmall,
+                strings.settingsAdbPathHint,
+                style = MaterialTheme.typography.bodyMedium,
             )
-        }
 
-        LanguagePicker(state)
+            OutlinedTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                label = { Text(strings.settingsAdbPathLabel) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
 
-        Row {
-            OutlinedButton(onClick = { state.screen = Screen.Main }) {
-                Text(strings.back)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { state.applyAdbPath(draft) }) {
+                    Text(strings.save)
+                }
+                OutlinedButton(onClick = { state.autoDetectAdb() }) {
+                    Text(strings.settingsAutoDetect)
+                }
+                OutlinedButton(onClick = {
+                    val picked = pickAdbBinary(strings.settingsPickAdbTitle)
+                    if (picked != null) {
+                        draft = picked
+                        state.applyAdbPath(picked)
+                    }
+                }) {
+                    Text(strings.browse)
+                }
             }
+
+            if (state.adbPathStatus.isNotBlank()) {
+                Text(
+                    "${strings.settingsStatusPrefix}${state.adbPathStatus}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            LanguagePicker(state)
         }
     }
 }

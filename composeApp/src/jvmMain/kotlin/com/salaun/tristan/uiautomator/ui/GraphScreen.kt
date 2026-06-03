@@ -147,32 +147,30 @@ fun GraphScreen(state: AppState) {
     val store = state.explorerStore
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(strings.graphTitle, style = MaterialTheme.typography.titleLarge)
-            Box(Modifier.weight(1f))
-            session?.let {
-                Text(
-                    strings.graphHeaderFmt.format(it.states.size, it.transitions.size),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            // HTML export only makes sense once we have a session loaded.
-            if (session != null) {
-                OutlinedButton(onClick = {
-                    val suggested = session.targetPackage.ifBlank { "graph" }
-                    val out = pickHtmlExportFile(strings.graphExportHtmlDialogTitle, suggested)
-                    if (out != null) state.exportGraphHtml(out)
-                }) { Text(strings.graphExportHtml) }
-            }
-            OutlinedButton(onClick = { state.screen = Screen.Sessions }) { Text(strings.toolbarSessions) }
-            OutlinedButton(onClick = { state.screen = Screen.Explorer }) { Text(strings.toolbarExplorer) }
-            OutlinedButton(onClick = { state.screen = Screen.Main }) { Text(strings.home) }
-        }
-        androidx.compose.material3.HorizontalDivider()
+        ScreenToolbar(
+            title = strings.graphTitle,
+            middle = {
+                session?.let {
+                    Text(
+                        strings.graphHeaderFmt.format(it.states.size, it.transitions.size),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                // HTML export only makes sense once we have a session loaded.
+                if (session != null) {
+                    OutlinedButton(onClick = {
+                        val suggested = session.targetPackage.ifBlank { "graph" }
+                        val out = pickHtmlExportFile(strings.graphExportHtmlDialogTitle, suggested)
+                        if (out != null) state.exportGraphHtml(out)
+                    }) { Text(strings.graphExportHtml) }
+                }
+            },
+            nav = {
+                ToolbarNavButton(strings.home, onClick = { state.go(Screen.Main) })
+                ToolbarNavButton(strings.toolbarExplorer, onClick = { state.go(Screen.Explorer) })
+                ToolbarNavButton(strings.toolbarSessions, onClick = { state.go(Screen.Sessions) })
+            },
+        )
 
         if (session == null || store == null) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -184,19 +182,27 @@ fun GraphScreen(state: AppState) {
             }
             var detailsWidth by remember(session.id) { mutableStateOf(420.dp) }
             var largeViewFor by remember(session.id) { mutableStateOf<String?>(null) }
+            // The "Outgoing transitions" row the pointer is hovering — drives the
+            // arrow highlight on the canvas and the action-bounds overlay on the
+            // selected screenshot.
+            var hoveredTransition by remember(session.id) { mutableStateOf<TransitionEntry?>(null) }
             // When non-null, the delete-confirmation dialog is shown for the
             // pending set of state ids. We compute the set of transitions
             // about to be removed once at confirm-time so the user knows
             // exactly what they're agreeing to.
             var pendingDelete by remember(session.id) { mutableStateOf<Set<String>?>(null) }
 
-            Row(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+            SessionPathBar(store)
+            Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 Box(modifier = Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surfaceVariant)) {
                     GraphCanvas(
                         session = session,
                         store = store,
                         selectedId = selectedId,
+                        hoveredTransition = hoveredTransition,
                         onSelect = { selectedId = it },
+                        onEnlarge = { largeViewFor = it },
                         onRequestDelete = { ids -> pendingDelete = ids },
                         onRequestMerge = { ids ->
                             // The state's own selection set is updated by the
@@ -220,10 +226,13 @@ fun GraphScreen(state: AppState) {
                     session = session,
                     store = store,
                     selectedId = selectedId,
+                    hoveredTransition = hoveredTransition,
                     onSelectState = { selectedId = it },
                     onEnlarge = { largeViewFor = it },
+                    onHoverTransition = { hoveredTransition = it },
                     modifier = Modifier.width(detailsWidth).fillMaxHeight(),
                 )
+            }
             }
 
             largeViewFor?.let { stateId ->
@@ -275,6 +284,38 @@ fun GraphScreen(state: AppState) {
     }
 }
 
+/**
+ * Thin bar under the graph toolbar showing the session's on-disk directory.
+ * The path is selectable and a Copy button puts it on the clipboard. Shown only
+ * for a session that has a directory (i.e. one persisted to / loaded from disk).
+ */
+@Composable
+private fun SessionPathBar(store: SessionStore) {
+    val strings = LocalStrings.current
+    val path = store.baseDir.absolutePath
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        SelectionContainer(modifier = Modifier.weight(1f)) {
+            Text(
+                path,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+            )
+        }
+        OutlinedButton(onClick = { copyTextToClipboard(path) }) { Text(strings.copy) }
+    }
+    androidx.compose.material3.HorizontalDivider()
+}
+
 private data class Layout(
     val positions: Map<String, Offset>,
     val totalW: Int,
@@ -318,11 +359,14 @@ private fun GraphCanvas(
     session: ExplorationSession,
     store: SessionStore,
     selectedId: String?,
+    hoveredTransition: TransitionEntry?,
     onSelect: (String) -> Unit,
+    onEnlarge: (String) -> Unit,
     onRequestDelete: (Set<String>) -> Unit,
     onRequestMerge: (Set<String>) -> Unit,
 ) {
     val strings = LocalStrings.current
+    val rootId = remember(session) { session.states.firstOrNull()?.id }
     val basePositions = remember(session) {
         autoPositions(session, colStep = COL_STEP, rowStep = ROW_STEP, margin = MARGIN)
     }
@@ -810,7 +854,7 @@ private fun GraphCanvas(
                             // graphicsLayer scale in one call.
                             .onGloballyPositioned { contentHostCoords = it },
                     ) {
-                        EdgeCanvas(session, layout, selectedId)
+                        EdgeCanvas(session, layout, selectedId, hoveredTransition)
                         for (stateEntry in session.states) {
                             val pos = layout.positions[stateEntry.id] ?: continue
                             // Wrap each card in a Box that carries the offset
@@ -896,6 +940,7 @@ private fun GraphCanvas(
                                         stateEntry = stateEntry,
                                 store = store,
                                 isSelected = stateEntry.id in multiSelection,
+                                isRoot = stateEntry.id == rootId,
                                 // Offset is handled by the wrapping Box above.
                                 position = Offset.Zero,
                                 onDragStart = {
@@ -996,6 +1041,7 @@ private fun GraphCanvas(
                                     dragIntendedPrimary = null
                                     persistLayout()
                                 },
+                                onDoubleClick = { onEnlarge(stateEntry.id) },
                                     )
                                 }   // closes the ContextMenuArea content block
                             }       // closes the wrapping offset Box
@@ -1066,7 +1112,12 @@ private fun DraggableStateCard(
     onDragStart: () -> Unit = {},
     onDrag: (Offset) -> Unit,
     onDragEnd: () -> Unit,
+    onDoubleClick: () -> Unit = {},
+    isRoot: Boolean = false,
 ) {
+    // Plain (non-state) holder for the last click time so a second click within
+    // the double-click window fires `onDoubleClick` instead of a second select.
+    val lastClickAt = remember(stateEntry.id) { longArrayOf(0L) }
     // The card's `position` is honoured here only when non-zero (callers may
     // already apply the offset on a wrapping Box — that's currently the case
     // inside the graph view, where the per-card `ContextMenuArea` needs the
@@ -1076,6 +1127,7 @@ private fun DraggableStateCard(
         stateEntry = stateEntry,
         store = store,
         isSelected = isSelected,
+        isRoot = isRoot,
         modifier = Modifier
             .offset(position.x.dp, position.y.dp)
             .size(CARD_W.dp, CARD_H.dp)
@@ -1113,7 +1165,18 @@ private fun DraggableStateCard(
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull { it.id == down.id } ?: break
                         if (change.changedToUp()) {
-                            if (dragMode) onDragEnd() else onClick(shift, ctrl)
+                            if (dragMode) {
+                                onDragEnd()
+                            } else {
+                                val now = System.currentTimeMillis()
+                                if (now - lastClickAt[0] < 300L) {
+                                    onDoubleClick()
+                                    lastClickAt[0] = 0L
+                                } else {
+                                    onClick(shift, ctrl)
+                                    lastClickAt[0] = now
+                                }
+                            }
                             break
                         }
                         // Use `positionChange()` (= position - previousPosition,
@@ -1174,11 +1237,19 @@ private fun VerticalSplitter(onDrag: (deltaDp: Float) -> Unit) {
 }
 
 @Composable
-private fun EdgeCanvas(session: ExplorationSession, layout: Layout, selectedId: String?) {
+private fun EdgeCanvas(
+    session: ExplorationSession,
+    layout: Layout,
+    selectedId: String?,
+    hoveredTransition: TransitionEntry?,
+) {
     val primary = MaterialTheme.colorScheme.primary
     val onSurface = MaterialTheme.colorScheme.onSurfaceVariant
     val errorColor = MaterialTheme.colorScheme.error
     val bidirectionalColor = MaterialTheme.colorScheme.tertiary
+    // Vivid, theme-independent colour for the hovered transition so it is
+    // unmistakable against any edge colour.
+    val hoverColor = Color(0xFFFF6D00)
 
     // Set of "productive" forward edges (excluding self-loops, leftApp, errors).
     // Used to detect bidirectional pairs: when both A→B and B→A exist, we
@@ -1242,7 +1313,12 @@ private fun EdgeCanvas(session: ExplorationSession, layout: Layout, selectedId: 
             }
 
             val highlight = selectedId != null && (t.from == selectedId || t.to == selectedId)
+            // The transition the pointer is hovering in the details list wins the
+            // strongest highlight so the user can pinpoint exactly which arrow it
+            // refers to.
+            val hovered = hoveredTransition != null && t === hoveredTransition
             val color = when {
+                hovered -> hoverColor
                 t.errorMessage != null -> errorColor
                 t.leftApp -> errorColor
                 t.loop -> onSurface
@@ -1250,7 +1326,7 @@ private fun EdgeCanvas(session: ExplorationSession, layout: Layout, selectedId: 
                 highlight -> primary
                 else -> onSurface.copy(alpha = 0.6f)
             }
-            val strokeWidth = if (highlight || isBidirectional) 2.5f else 1.5f
+            val strokeWidth = if (hovered) 6f else if (highlight || isBidirectional) 2.5f else 1.5f
             // The line should meet the BASE of each arrowhead, never its
             // tip — otherwise the stroke runs all the way into the triangle
             // and the line visibly pokes out the front of the arrow. We
@@ -1289,6 +1365,10 @@ private fun EdgeCanvas(session: ExplorationSession, layout: Layout, selectedId: 
                         )
                     }
                 }
+            }
+            if (hovered) {
+                // Translucent glow underlay so the hovered edge really stands out.
+                drawPath(path, color = hoverColor.copy(alpha = 0.30f), style = Stroke(width = strokeWidth + 12f))
             }
             drawPath(path, color = color, style = Stroke(width = strokeWidth))
             if (t.to != null) {
@@ -1471,11 +1551,17 @@ private fun StateCard(
     store: SessionStore,
     isSelected: Boolean,
     modifier: Modifier,
+    isRoot: Boolean = false,
 ) {
     val bitmap = remember(stateEntry.id, stateEntry.screenshotPath) {
         loadThumbnail(store, stateEntry.screenshotPath)
     }
-    val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+    val rootColor = Color(0xFF2E7D32)
+    val borderColor = when {
+        isRoot -> rootColor
+        isSelected -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.outline
+    }
     // No `Modifier.clickable` here on purpose: the wrapping
     // `DraggableStateCard` runs a custom pointer gesture that needs to read
     // the keyboard modifiers at press time (Shift/Ctrl drive multi-selection).
@@ -1486,11 +1572,22 @@ private fun StateCard(
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surface)
-            .border(if (isSelected) 2.dp else 1.dp, borderColor, RoundedCornerShape(8.dp))
+            .border(if (isRoot || isSelected) 3.dp else 1.dp, borderColor, RoundedCornerShape(8.dp))
             .padding(6.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (isRoot) {
+                // The entry point of the app — flagged so it is unmistakable.
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(rootColor)
+                        .padding(horizontal = 5.dp, vertical = 1.dp),
+                ) {
+                    Text("▶ START", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                }
+            }
             Text(stateEntry.id, style = MaterialTheme.typography.titleSmall)
             Text("d=${stateEntry.depth}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("· ${stateEntry.clickables.size} actions", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1519,8 +1616,10 @@ private fun DetailsPanel(
     session: ExplorationSession,
     store: SessionStore,
     selectedId: String?,
+    hoveredTransition: TransitionEntry?,
     onSelectState: (String) -> Unit,
     onEnlarge: (String) -> Unit,
+    onHoverTransition: (TransitionEntry?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val strings = LocalStrings.current
@@ -1564,6 +1663,28 @@ private fun DetailsPanel(
             ) {
                 if (bmp != null) {
                     Image(bitmap = bmp, contentDescription = null, modifier = Modifier.fillMaxSize())
+                    // When a transition row is hovered, outline where its action
+                    // is located on this state's screenshot (the tap target).
+                    val hb = hoveredTransition?.takeIf { it.from == selected.id }?.action?.bounds
+                    if (hb != null) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val imgW = bmp.width.toFloat()
+                            val imgH = bmp.height.toFloat()
+                            if (imgW <= 0f || imgH <= 0f) return@Canvas
+                            // Image is shown with ContentScale.Fit (centered), so
+                            // map device-pixel bounds through the same fit scale.
+                            val scale = min(size.width / imgW, size.height / imgH)
+                            val offX = (size.width - imgW * scale) / 2f
+                            val offY = (size.height - imgH * scale) / 2f
+                            val hoverColor = Color(0xFFFF6D00)
+                            val tl = Offset(offX + hb.left * scale, offY + hb.top * scale)
+                            val sz = Size((hb.right - hb.left) * scale, (hb.bottom - hb.top) * scale)
+                            // Translucent fill + bold border so the tapped area
+                            // on the screenshot is impossible to miss.
+                            drawRect(color = hoverColor.copy(alpha = 0.28f), topLeft = tl, size = sz)
+                            drawRect(color = hoverColor, topLeft = tl, size = sz, style = Stroke(width = 5f))
+                        }
+                    }
                 } else {
                     Text(strings.graphCaptureUnavailable)
                 }
@@ -1575,7 +1696,14 @@ private fun DetailsPanel(
                 Text(strings.graphBulletDash, style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(modifier = Modifier.fillMaxWidth().height(160.dp)) {
-                    items(outgoing) { t -> TransitionRow(t, strings) { if (it != null) onSelectState(it) } }
+                    items(outgoing) { t ->
+                        TransitionRow(
+                            t = t,
+                            strings = strings,
+                            onHover = { entered -> onHoverTransition(if (entered) t else null) },
+                            onSelectTarget = { if (it != null) onSelectState(it) },
+                        )
+                    }
                 }
             }
         }
@@ -1583,10 +1711,31 @@ private fun DetailsPanel(
 }
 
 @Composable
-private fun TransitionRow(t: TransitionEntry, strings: Strings, onSelectTarget: (String?) -> Unit) {
+private fun TransitionRow(
+    t: TransitionEntry,
+    strings: Strings,
+    onSelectTarget: (String?) -> Unit,
+    onHover: (Boolean) -> Unit = {},
+) {
     val errorColor = MaterialTheme.colorScheme.error
     Column(
-        modifier = Modifier.fillMaxWidth().clickable { onSelectTarget(t.to) }.padding(vertical = 2.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onSelectTarget(t.to) }
+            // Report hover so the canvas can highlight the matching arrow and the
+            // screenshot can outline the action's bounds.
+            .pointerInput(t) {
+                awaitPointerEventScope {
+                    while (true) {
+                        when (awaitPointerEvent().type) {
+                            PointerEventType.Enter -> onHover(true)
+                            PointerEventType.Exit -> onHover(false)
+                            else -> {}
+                        }
+                    }
+                }
+            }
+            .padding(vertical = 2.dp),
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             val target = when {

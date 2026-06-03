@@ -64,6 +64,19 @@ class AppState(
     var statusMessage: String by mutableStateOf("")
     var errorMessage: String? by mutableStateOf(null)
 
+    /**
+     * Centralised navigation. The capture status line is deliberately NOT
+     * cleared here: it belongs to the Main screen's capture (like the
+     * screenshot and the XML) and only Main renders it, so it persists while
+     * you go to another screen and back. The transient error message, on the
+     * other hand, is dropped so a stale error from one screen doesn't bleed
+     * onto the next.
+     */
+    fun go(target: Screen) {
+        errorMessage = null
+        screen = target
+    }
+
     var screenshotPng: ByteArray? by mutableStateOf(null)
     var xmlText: String? by mutableStateOf(null)
     var rootNode: UiNode? by mutableStateOf(null)
@@ -242,6 +255,12 @@ class AppState(
 
     fun toggle(node: UiNode) {
         if (node in expanded) expanded -= node else expanded += node
+    }
+
+    /** Replaces the whole tree-expansion set (expand-all / collapse-all / deep toggle). */
+    fun setExpanded(nodes: Set<UiNode>) {
+        expanded.clear()
+        expanded.addAll(nodes)
     }
 
     fun selectNode(node: UiNode?) {

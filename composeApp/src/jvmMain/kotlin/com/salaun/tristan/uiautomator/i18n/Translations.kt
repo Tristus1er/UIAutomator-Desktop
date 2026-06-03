@@ -22,6 +22,7 @@ object Translations {
         importLabel = "Import…",
         exportLabel = "Export…",
         home = "Home",
+        copy = "Copy",
 
         toolbarCapture = "Capture",
         toolbarRefreshDevices = "Refresh devices",
@@ -62,6 +63,8 @@ object Translations {
 
         treeEmpty = "UI tree is empty.",
         treeSelectNodeHint = "Select a node to see its attributes.",
+        treeExpandAll = "Expand all",
+        treeCollapseAll = "Collapse all",
 
         settingsTitle = "Settings",
         settingsAdbPathHint = "Path to the ADB executable (platform-tools). The first launch attempts an auto-detection.",
@@ -194,6 +197,7 @@ object Translations {
         importLabel = "Importer…",
         exportLabel = "Exporter…",
         home = "Accueil",
+        copy = "Copier",
 
         toolbarCapture = "Capturer",
         toolbarRefreshDevices = "Actualiser devices",
@@ -234,6 +238,8 @@ object Translations {
 
         treeEmpty = "Arbre de l'interface vide.",
         treeSelectNodeHint = "Sélectionnez un nœud pour voir ses attributs.",
+        treeExpandAll = "Tout déplier",
+        treeCollapseAll = "Tout replier",
 
         settingsTitle = "Paramètres",
         settingsAdbPathHint = "Chemin vers l'exécutable ADB (platform-tools). La première ouverture tente une autodétection automatique.",
@@ -363,6 +369,7 @@ object Translations {
         importLabel = "Importar…",
         exportLabel = "Exportar…",
         home = "Inicio",
+        copy = "Copiar",
 
         toolbarCapture = "Capturar",
         toolbarRefreshDevices = "Actualizar dispositivos",
@@ -403,6 +410,8 @@ object Translations {
 
         treeEmpty = "El árbol de la interfaz está vacío.",
         treeSelectNodeHint = "Seleccione un nodo para ver sus atributos.",
+        treeExpandAll = "Expandir todo",
+        treeCollapseAll = "Contraer todo",
 
         settingsTitle = "Ajustes",
         settingsAdbPathHint = "Ruta al ejecutable de ADB (platform-tools). En el primer arranque se intenta detectar automáticamente.",
@@ -532,6 +541,7 @@ object Translations {
         importLabel = "Importieren…",
         exportLabel = "Exportieren…",
         home = "Start",
+        copy = "Kopieren",
 
         toolbarCapture = "Aufnehmen",
         toolbarRefreshDevices = "Geräte aktualisieren",
@@ -572,6 +582,8 @@ object Translations {
 
         treeEmpty = "UI-Baum ist leer.",
         treeSelectNodeHint = "Wählen Sie einen Knoten, um seine Attribute zu sehen.",
+        treeExpandAll = "Alle ausklappen",
+        treeCollapseAll = "Alle einklappen",
 
         settingsTitle = "Einstellungen",
         settingsAdbPathHint = "Pfad zur ADB-Ausführung (platform-tools). Beim ersten Start wird eine Auto-Erkennung versucht.",

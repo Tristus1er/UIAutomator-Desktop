@@ -208,6 +208,7 @@ private fun ScreenshotDetailContent(
                         clickedClickable = node?.let { clickableFor(it) }
                     },
                     modifier = Modifier.fillMaxWidth().weight(1f),
+                    onExpandedChange = { expanded.clear(); expanded.addAll(it) },
                 )
                 HorizontalDivider()
                 DestinationInfo(

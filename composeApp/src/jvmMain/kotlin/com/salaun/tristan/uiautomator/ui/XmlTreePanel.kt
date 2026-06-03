@@ -1,8 +1,11 @@
 package com.salaun.tristan.uiautomator.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -57,6 +60,8 @@ fun XmlTreePanel(
     onToggle: (UiNode) -> Unit,
     onSelect: (UiNode?) -> Unit,
     modifier: Modifier = Modifier,
+    /** Replaces the whole expanded set — used by expand-all / collapse-all and deep double-click toggle. */
+    onExpandedChange: (Set<UiNode>) -> Unit = {},
 ) {
     val rows: List<TreeRow> by remember(root) {
         derivedStateOf { buildRows(root, expanded) }
@@ -122,11 +127,25 @@ fun XmlTreePanel(
                 }
             },
     ) {
-        Box(modifier = Modifier.weight(1f)) {
+        if (root != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(onClick = { onExpandedChange(expandableSubtree(root)) }) {
+                    Text(LocalStrings.current.treeExpandAll, style = MaterialTheme.typography.bodySmall)
+                }
+                OutlinedButton(onClick = { onExpandedChange(emptySet()) }) {
+                    Text(LocalStrings.current.treeCollapseAll, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            HorizontalDivider()
+        }
+        Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             if (root == null) {
                 Text(
                     LocalStrings.current.treeEmpty,
-                    modifier = Modifier.align(Alignment.Center),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
@@ -187,6 +206,12 @@ fun XmlTreePanel(
                             isExpanded = row.node in expanded,
                             isSelected = row.node === selectedNode,
                             onToggle = { onToggle(row.node) },
+                            // Double-click deep-toggles the whole subtree: open
+                            // it all if currently collapsed, fold it all if open.
+                            onToggleDeep = {
+                                val sub = expandableSubtree(row.node)
+                                onExpandedChange(if (row.node in expanded) expanded - sub else expanded + sub)
+                            },
                             onHover = { handleRowHover(row.node) },
                             onSelect = {
                                 onSelect(row.node)
@@ -206,12 +231,14 @@ fun XmlTreePanel(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TreeRowItem(
     row: TreeRow,
     isExpanded: Boolean,
     isSelected: Boolean,
     onToggle: () -> Unit,
+    onToggleDeep: () -> Unit = {},
     onHover: () -> Unit = {},
     onSelect: () -> Unit,
 ) {
@@ -238,7 +265,7 @@ private fun TreeRowItem(
                     }
                 }
             }
-            .clickable { onSelect() }
+            .combinedClickable(onClick = { onSelect() }, onDoubleClick = { onToggleDeep() })
             .padding(vertical = 2.dp, horizontal = 4.dp),
     ) {
         Box(modifier = Modifier.width((row.depth * 12).dp))
@@ -319,6 +346,17 @@ private fun DetailsPanel(node: UiNode?) {
             }
         }
     }
+}
+
+/** Every node in [node]'s subtree (including [node]) that has children, i.e. can be expanded. */
+private fun expandableSubtree(node: UiNode): Set<UiNode> {
+    val out = HashSet<UiNode>()
+    fun visit(n: UiNode) {
+        if (n.children.isNotEmpty()) out += n
+        for (c in n.children) visit(c)
+    }
+    visit(node)
+    return out
 }
 
 private fun buildRows(root: UiNode?, expanded: Set<UiNode>): List<TreeRow> {

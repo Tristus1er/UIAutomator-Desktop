@@ -1,15 +1,19 @@
 package com.salaun.tristan.uiautomator.ui
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,6 +39,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
@@ -43,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import com.salaun.tristan.uiautomator.AppState
 import com.salaun.tristan.uiautomator.Screen
+import com.salaun.tristan.uiautomator.explorer.SessionStore
 import com.salaun.tristan.uiautomator.explorer.SessionSummary
 import com.salaun.tristan.uiautomator.i18n.LocalStrings
 import com.salaun.tristan.uiautomator.i18n.Strings
@@ -63,20 +69,22 @@ fun SessionsScreen(state: AppState) {
     val toastScope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(strings.sessionsTitle, style = MaterialTheme.typography.headlineSmall)
-            Box(Modifier.weight(1f))
-            OutlinedButton(onClick = { refreshTick++ }) { Text(strings.sessionsRefresh) }
-            OutlinedButton(onClick = {
-                val picked = pickImportZip(strings.sessionsImportDialogTitle)
-                if (picked != null) {
-                    state.importSession(picked, openAfter = true)
-                    refreshTick++
-                }
-            }) { Text(strings.importLabel) }
-            OutlinedButton(onClick = { state.screen = Screen.Main }) { Text(strings.back) }
-        }
+    Column(modifier = Modifier.fillMaxSize()) {
+        ScreenToolbar(
+            title = strings.sessionsTitle,
+            middle = {
+                OutlinedButton(onClick = { refreshTick++ }) { Text(strings.sessionsRefresh) }
+                OutlinedButton(onClick = {
+                    val picked = pickImportZip(strings.sessionsImportDialogTitle)
+                    if (picked != null) {
+                        state.importSession(picked, openAfter = true)
+                        refreshTick++
+                    }
+                }) { Text(strings.importLabel) }
+            },
+            nav = { ToolbarNavButton(strings.home, onClick = { state.go(Screen.Main) }) },
+        )
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
 
         // Folder line: selectable text + right-click to copy. The text wraps a
         // SelectionContainer so the user can drag-select chars manually; the
@@ -117,9 +125,6 @@ fun SessionsScreen(state: AppState) {
         )
 
         state.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        if (state.statusMessage.isNotBlank()) {
-            Text(state.statusMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
 
         HorizontalDivider()
 
@@ -146,6 +151,7 @@ fun SessionsScreen(state: AppState) {
                 }
             }
         }
+    }
     }
 
     toDelete?.let { summary ->
@@ -200,6 +206,7 @@ private fun SessionRow(
                 )
                 Text(summary.dir.name, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            SessionThumbnails(summary, modifier = Modifier.weight(1f))
             Column(horizontalAlignment = Alignment.End) {
                 Text(formatTimestamp(summary.session.startedAt), style = MaterialTheme.typography.bodySmall)
                 Text(
@@ -217,6 +224,40 @@ private fun SessionRow(
             OutlinedButton(onClick = onExport) { Text(strings.exportLabel) }
             OutlinedButton(onClick = onDelete) {
                 Text(strings.delete, color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+}
+
+/**
+ * Shows the first 1-3 captured screens of a session as small thumbnails between
+ * the session's metadata columns. The count adapts to the width actually
+ * available (via [BoxWithConstraints]) so narrow windows simply show fewer.
+ */
+@Composable
+private fun SessionThumbnails(summary: SessionSummary, modifier: Modifier = Modifier) {
+    val store = remember(summary.dir.absolutePath) { SessionStore(summary.dir) }
+    BoxWithConstraints(modifier = modifier, contentAlignment = Alignment.Center) {
+        // ~64dp per thumbnail cell (thumb + gap); never more than 3.
+        val maxCount = (maxWidth / 64.dp).toInt().coerceIn(0, 3)
+        if (maxCount == 0) return@BoxWithConstraints
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            summary.session.states.take(maxCount).forEach { st ->
+                val bmp = remember(summary.dir.absolutePath, st.screenshotPath) {
+                    loadThumbnail(store, st.screenshotPath)
+                }
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp,
+                        contentDescription = st.id,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .height(76.dp)
+                            .widthIn(max = 56.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(MaterialTheme.colorScheme.surface),
+                    )
+                }
             }
         }
     }

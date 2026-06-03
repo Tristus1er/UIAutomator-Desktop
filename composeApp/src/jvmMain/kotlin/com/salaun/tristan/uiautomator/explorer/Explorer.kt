@@ -599,11 +599,22 @@ class Explorer(
             return classifyBehindPermission(source, click, grant) ?: reanchor() ?: source
         }
 
-        // Left the target app: record it, step back in, and continue from
-        // wherever that lands.
+        // Left the target app (e.g. a tap opened a web page in the browser).
+        // We don't explore foreign apps, but instead of leaving a dangling
+        // arrow we capture that external screen as a terminal state — so its
+        // screenshot is kept and the edge points at it — then BACK out to the
+        // source and carry on.
         if (config.targetPackage.isNotBlank() && after.pkg != config.targetPackage) {
-            listener.onLog("  ⇗ left app (${after.pkg}), BACK")
-            session.transitions += TransitionEntry(source.id, null, click, leftApp = true)
+            val knownId = fingerprintToId[after.fingerprint]
+            val externalId = if (knownId != null) {
+                knownId
+            } else {
+                registerExternalState(after, source.pathFromRoot + click)
+                    .also { fingerprintToId[after.fingerprint] = it.id }.id
+            }
+            listener.onLog("  ⇗ left app (${after.pkg}) → captured as $externalId, BACK")
+            session.transitions += TransitionEntry(source.id, externalId, click, leftApp = true)
+            backLeadsTo[externalId] = source.id
             countProcessed(source.id, click.label); persist()
             runCatching { adb.pressBack(serial) }
             delay(config.settleDelayMs)
@@ -821,6 +832,32 @@ class Explorer(
         // this dialog, because once granted the system won't show it again.
         permissionDialogStateIds += id
         listener.onLog("  📋 captured permission dialog as $id (one-time)")
+        return entry
+    }
+
+    /**
+     * Registers a screen that belongs to a *foreign* app (a browser page, a
+     * share sheet, an external viewer) as a terminal state: its screenshot and
+     * dump are kept so the graph shows where the tap led, but its clickables
+     * are left empty so the crawler never tries to explore inside another app.
+     */
+    private fun registerExternalState(snap: Snapshot, path: List<ClickableRef>): StateEntry {
+        val id = "S${session.states.size}"
+        val screenshotPath = store.writeScreenshot(id, snap.png)
+        val xmlPath = store.writeXml(id, snap.xml)
+        val entry = StateEntry(
+            id = id,
+            fingerprint = snap.fingerprint,
+            packageName = snap.pkg,
+            depth = path.size,
+            screenshotPath = screenshotPath,
+            xmlPath = xmlPath,
+            clickables = emptyList(),
+            pathFromRoot = path,
+        )
+        session.states += entry
+        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        listener.onLog("  📸 captured external screen (${snap.pkg}) as $id")
         return entry
     }
 

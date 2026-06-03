@@ -145,17 +145,17 @@ class ExplorerDfsTest {
     }
 
     @Test
-    fun `leaving the target package records leftApp and the explorer keeps going`() {
+    fun `leaving the target package captures the external screen as a terminal state`() {
         val fake = FakeAdbGateway(
             screens = mapOf(
-                "home" to FakeAdbGateway.Screen(screen("home", listOf(Btn("settings", 100, 100), Btn("inside", 100, 200)))),
-                "settings_page" to FakeAdbGateway.Screen(
-                    screen("settings").replace(pkg, "com.android.settings")
+                "home" to FakeAdbGateway.Screen(screen("home", listOf(Btn("web", 100, 100), Btn("inside", 100, 200)))),
+                "web_page" to FakeAdbGateway.Screen(
+                    screen("web").replace(pkg, "com.android.chrome")
                 ),
                 "inside_page" to FakeAdbGateway.Screen(screen("inside")),
             ),
             tapTable = mapOf(
-                FakeAdbGateway.TapKey("home", 100, 100) to "settings_page",
+                FakeAdbGateway.TapKey("home", 100, 100) to "web_page",
                 FakeAdbGateway.TapKey("home", 100, 200) to "inside_page",
             ),
             launchTarget = "home",
@@ -163,11 +163,15 @@ class ExplorerDfsTest {
 
         val session = runExplorer(fake)
 
+        // The left-app edge now points at a captured external state, not a
+        // dangling null — so the arrow leads to a real screenshot.
         val leftApp = session.transitions.single { it.leftApp }
         assertEquals("S0", leftApp.from)
-        assertNull(leftApp.to)
-        assertTrue(session.states.none { it.packageName == "com.android.settings" })
-        // The other button was still exercised, producing a new state.
+        assertNotNull(leftApp.to, "the left-app edge must point at the captured external screen")
+        val external = session.states.single { it.id == leftApp.to }
+        assertEquals("com.android.chrome", external.packageName)
+        assertTrue(external.clickables.isEmpty(), "an external screen is terminal — never explored")
+        // The crawler stepped back into the app and still exercised the other button.
         assertNotNull(session.transitions.firstOrNull { !it.leftApp && it.to != null })
     }
 

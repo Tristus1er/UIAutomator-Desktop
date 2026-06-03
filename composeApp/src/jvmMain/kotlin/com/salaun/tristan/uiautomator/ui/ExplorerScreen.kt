@@ -44,19 +44,22 @@ import com.salaun.tristan.uiautomator.i18n.LocalStrings
 @Composable
 fun ExplorerScreen(state: AppState) {
     val strings = LocalStrings.current
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(strings.explorerTitle, style = MaterialTheme.typography.headlineSmall)
-            Box(Modifier.weight(1f))
-            OutlinedButton(onClick = { state.screen = Screen.Main }) { Text(strings.back) }
-            OutlinedButton(
-                enabled = state.explorerSession != null && !state.explorerRunning,
-                onClick = { state.openGraphForCurrentSession() },
-            ) { Text(strings.explorerViewGraph) }
-        }
+    Column(modifier = Modifier.fillMaxSize()) {
+        ScreenToolbar(
+            title = strings.explorerTitle,
+            nav = {
+                ToolbarNavButton(strings.home, onClick = { state.go(Screen.Main) })
+                ToolbarNavButton(
+                    strings.explorerViewGraph,
+                    onClick = { state.openGraphForCurrentSession() },
+                    enabled = state.explorerSession != null && !state.explorerRunning,
+                )
+            },
+        )
+        Column(
+            modifier = Modifier.fillMaxSize().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
 
         ConfigRow(state)
 
@@ -103,6 +106,7 @@ fun ExplorerScreen(state: AppState) {
             LogPanel(state, modifier = Modifier.weight(1f).fillMaxHeight().padding(end = 8.dp))
             VerticalDivider(modifier = Modifier.fillMaxHeight())
             SummaryPanel(state, modifier = Modifier.width(360.dp).fillMaxHeight().padding(start = 8.dp))
+        }
         }
     }
 }

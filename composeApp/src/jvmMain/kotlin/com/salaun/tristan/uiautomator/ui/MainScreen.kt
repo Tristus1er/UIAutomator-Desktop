@@ -38,7 +38,6 @@ import com.salaun.tristan.uiautomator.i18n.LocalStrings
 fun MainScreen(state: AppState) {
     Column(modifier = Modifier.fillMaxSize()) {
         Toolbar(state)
-        HorizontalDivider()
         Row(modifier = Modifier.fillMaxSize()) {
             ScreenshotPanel(
                 pngBytes = state.screenshotPng,
@@ -58,6 +57,7 @@ fun MainScreen(state: AppState) {
                 // selection when the pointer leaves the panel.
                 onSelect = { state.selectNode(it) },
                 modifier = Modifier.weight(1f).fillMaxHeight(),
+                onExpandedChange = { state.setExpanded(it) },
             )
         }
     }
@@ -66,32 +66,26 @@ fun MainScreen(state: AppState) {
 @Composable
 private fun Toolbar(state: AppState) {
     val strings = LocalStrings.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Button(
-            onClick = { state.capture() },
-            enabled = !state.busy && state.adbPath.isNotBlank(),
-        ) { Text(strings.toolbarCapture) }
+    ScreenToolbar(
+        title = "UIAutomator",
+        middle = {
+            Button(
+                onClick = { state.capture() },
+                enabled = !state.busy && state.adbPath.isNotBlank(),
+            ) { Text(strings.toolbarCapture) }
 
-        OutlinedButton(onClick = { state.refreshDevices() }, enabled = !state.busy) {
-            Text(strings.toolbarRefreshDevices)
-        }
+            OutlinedButton(onClick = { state.refreshDevices() }, enabled = !state.busy) {
+                Text(strings.toolbarRefreshDevices)
+            }
 
-        DeviceSelector(state)
+            DeviceSelector(state)
 
-        CaptureActionsMenu(state)
+            CaptureActionsMenu(state)
 
-        if (state.busy) {
-            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-        }
+            if (state.busy) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            }
 
-        Box(modifier = Modifier.weight(1f)) {
             Column {
                 state.errorMessage?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -100,26 +94,17 @@ private fun Toolbar(state: AppState) {
                     Text(state.statusMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-        }
-
-        TextButton(onClick = { state.screen = Screen.Explorer }) {
-            Text(strings.toolbarExplorer)
-        }
-        TextButton(onClick = { state.screen = Screen.ManualExplorer }) {
-            Text(strings.manualToolbarLabel)
-        }
-        TextButton(onClick = { state.screen = Screen.Sessions }) {
-            Text(strings.toolbarSessions)
-        }
-        if (state.explorerSession != null) {
-            TextButton(onClick = { state.screen = Screen.Graph }) {
-                Text(strings.toolbarGraph)
+        },
+        nav = {
+            ToolbarNavButton(strings.toolbarExplorer, onClick = { state.go(Screen.Explorer) })
+            ToolbarNavButton(strings.manualToolbarLabel, onClick = { state.go(Screen.ManualExplorer) })
+            ToolbarNavButton(strings.toolbarSessions, onClick = { state.go(Screen.Sessions) })
+            if (state.explorerSession != null) {
+                ToolbarNavButton(strings.toolbarGraph, onClick = { state.go(Screen.Graph) })
             }
-        }
-        TextButton(onClick = { state.screen = Screen.Settings }) {
-            Text(strings.toolbarSettings)
-        }
-    }
+            ToolbarNavButton(strings.toolbarSettings, onClick = { state.go(Screen.Settings) })
+        },
+    )
 }
 
 @Composable

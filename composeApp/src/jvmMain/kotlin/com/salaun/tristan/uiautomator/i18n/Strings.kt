@@ -25,6 +25,7 @@ data class Strings(
     val importLabel: String,
     val exportLabel: String,
     val home: String,
+    val copy: String,
 
     // -- Toolbar / MainScreen -------------------------------------------------
     val toolbarCapture: String,
@@ -70,6 +71,8 @@ data class Strings(
     // -- XML tree panel -------------------------------------------------------
     val treeEmpty: String,
     val treeSelectNodeHint: String,
+    val treeExpandAll: String,
+    val treeCollapseAll: String,
 
     // -- Settings screen ------------------------------------------------------
     val settingsTitle: String,

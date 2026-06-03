@@ -45,7 +45,7 @@ internal fun autoPositions(
     colStep: Int,
     rowStep: Int,
     margin: Int,
-    iterations: Int = 450,
+    iterations: Int = 600,
 ): Map<String, Offset> {
     val ids: List<String> = session.states.map { it.id }
     if (ids.isEmpty()) return emptyMap()
@@ -80,8 +80,10 @@ internal fun autoPositions(
     val px = DoubleArray(n)
     val py = DoubleArray(n)
     val pos = HashMap<String, Int>(n) // id -> slot index in px/py
+    val slotLayer = IntArray(n)
     order.forEachIndexed { slot, id ->
         pos[id] = slot
+        slotLayer[slot] = layer[id] ?: 0
         px[slot] = (slot % cols) * colStep.toDouble()
         py[slot] = (slot / cols) * rowStep.toDouble()
     }
@@ -134,6 +136,19 @@ internal fun autoPositions(
             dispX[a] -= ux * att; dispY[a] -= uy * att
             dispX[b] += ux * att; dispY[b] += uy * att
         }
+        // Direction-consistency bias: gently push a forward edge so its
+        // deeper-layer end sits lower than the shallower one, giving the whole
+        // graph a coherent top→down flow. This stops two connected tiles from
+        // ending up reversed (which crosses their arrows). It's weak and the
+        // frame still confines the result, so a long chain folds rather than
+        // stretching into a single column.
+        val flowBias = k * 0.10
+        for ((a, b) in edgeSlots) {
+            val la = slotLayer[a]
+            val lb = slotLayer[b]
+            if (lb > la) { dispY[a] -= flowBias; dispY[b] += flowBias }
+            else if (la > lb) { dispY[a] += flowBias; dispY[b] -= flowBias }
+        }
         // Apply, capped by the cooling temperature, and confine to the frame.
         for (i in 0 until n) {
             val len = sqrt(dispX[i] * dispX[i] + dispY[i] * dispY[i])
@@ -146,7 +161,47 @@ internal fun autoPositions(
         temp -= cool
     }
 
+    // Alignment snap: pull near-aligned nodes onto a shared column / row so the
+    // result reads as tidy lines instead of a slightly-jittered cloud — the
+    // "reward alignment" goal. Gentle and bounded; the overlap pass afterwards
+    // separates any cards this brought too close, pushing them apart along the
+    // axis that is NOT aligned so the shared column/row is preserved.
+    val alignThrX = colStep * 0.35
+    val alignThrY = rowStep * 0.35
+    repeat(14) {
+        for (i in 0 until n) {
+            for (j in i + 1 until n) {
+                if (kotlin.math.abs(px[i] - px[j]) < alignThrX) {
+                    val mid = (px[i] + px[j]) / 2
+                    px[i] += (mid - px[i]) * 0.5
+                    px[j] += (mid - px[j]) * 0.5
+                }
+                if (kotlin.math.abs(py[i] - py[j]) < alignThrY) {
+                    val mid = (py[i] + py[j]) / 2
+                    py[i] += (mid - py[i]) * 0.5
+                    py[j] += (mid - py[j]) * 0.5
+                }
+            }
+        }
+    }
+
     resolveOverlaps(px, py, cellW = colStep.toDouble(), cellH = rowStep.toDouble())
+
+    // Anchor the entry point (S0 = the first state) as the clear leftmost,
+    // vertically-centred node, so the reader instantly spots where the graph
+    // begins. It gets its own column to the left of everything else (no overlap
+    // possible there), centred against the rest of the graph.
+    val rootSlot = pos[ids.first()]
+    if (rootSlot != null && n > 1) {
+        var minOtherX = Double.POSITIVE_INFINITY
+        var sumY = 0.0
+        for (i in 0 until n) if (i != rootSlot) {
+            if (px[i] < minOtherX) minOtherX = px[i]
+            sumY += py[i]
+        }
+        px[rootSlot] = minOtherX - colStep
+        py[rootSlot] = sumY / (n - 1)
+    }
 
     var minX = Double.POSITIVE_INFINITY
     var minY = Double.POSITIVE_INFINITY
