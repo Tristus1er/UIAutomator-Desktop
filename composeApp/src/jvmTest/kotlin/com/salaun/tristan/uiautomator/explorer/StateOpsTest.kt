@@ -110,6 +110,38 @@ class StateOpsTest {
     }
 
     @Test
+    fun `rootScreenId returns the app root container, skipping the framework content frame and small widgets`() {
+        // android:id/content is the platform decor frame shared by every screen
+        // (must be skipped); settings_screen is the app's full-screen container
+        // (the answer); the switch is a small widget (too small to be the root).
+        val xml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" resource-id="android:id/content" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" class="android.view.View" resource-id="settings_screen" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node index="0" class="android.view.View" resource-id="notifications_switch" package="com.example.app" clickable="true" enabled="true" bounds="[0,401][1080,591]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        val root = assertNotNull(DumpParser.parse(xml))
+        assertEquals("settings_screen", StateOps.rootScreenId(root, "com.example.app"))
+    }
+
+    @Test
+    fun `rootScreenId is null when no full-screen app container exists`() {
+        // A dialog: only the framework frame spans the screen; the dialog body
+        // is a small panel. No app-owned full-screen container → null, so the
+        // caller falls back to the structural fingerprint.
+        val xml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" resource-id="android:id/content" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" class="android.view.View" resource-id="dialog_body" package="com.example.app" clickable="false" enabled="true" bounds="[140,900][940,1400]"/>
+  </node>
+</hierarchy>"""
+        val root = assertNotNull(DumpParser.parse(xml))
+        assertEquals(null, StateOps.rootScreenId(root, "com.example.app"))
+    }
+
+    @Test
     fun `structureFingerprint is invariant when only labelled text changes`() {
         // The two hour-picker dumps have identical DOM but different title
         // text. The strict fingerprint shifts (text on resource-id'd nodes

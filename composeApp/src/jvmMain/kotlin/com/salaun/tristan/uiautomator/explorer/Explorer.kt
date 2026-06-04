@@ -82,6 +82,16 @@ class Explorer(
     private lateinit var listener: Listener
     private val fingerprintToId = HashMap<String, String>()
     /**
+     * Maps a screen's *root container id* (e.g. a Compose `settings_screen`
+     * testTag — see [StateOps.rootScreenId]) to the first state that carried it.
+     * This is the stable screen identity that lets the explorer recognise the
+     * same screen across toggle flips, switch checks and scroll positions
+     * (which all shift the structural fingerprint) instead of duplicating it
+     * into S4, S5, S6… Only screens that expose such a root id participate;
+     * everything else falls back to the exact fingerprint.
+     */
+    private val rootIdToStateId = HashMap<String, String>()
+    /**
      * Per-state structure fingerprint (text-free SHA-1 of the DOM). Used to
      * recognise "the same logical screen with a different selection" after a
      * tap on a picker / list / grid cell — see [isSelectionWithinSameScreen].
@@ -466,7 +476,7 @@ class Explorer(
                     runCatching { adb.inputTap(serial, step.action.tapX, step.action.tapY) }
                     delay(config.settleDelayMs)
                     val snap = runCatching { capture() }.getOrNull() ?: return null
-                    fingerprintToId[snap.fingerprint]
+                    resolveKnownStateId(snap)
                 }
                 is NavStep.Back -> climbBackTo(step)
             }
@@ -495,7 +505,7 @@ class Explorer(
             runCatching { adb.pressBack(serial) }
             delay(config.settleDelayMs)
             val snap = runCatching { capture() }.getOrNull() ?: return null
-            val landed = fingerprintToId[snap.fingerprint]
+            val landed = resolveKnownStateId(snap)
             if (landed != null) {
                 backLeadsTo[step.from] = landed
                 return landed
@@ -534,7 +544,7 @@ class Explorer(
     /** Capture the current screen and return the known state it maps to, if any. */
     private suspend fun reanchor(): StateEntry? {
         val snap = runCatching { capture() }.getOrNull() ?: return null
-        val id = fingerprintToId[snap.fingerprint] ?: return null
+        val id = resolveKnownStateId(snap) ?: return null
         return session.states.firstOrNull { it.id == id }
     }
 
@@ -561,7 +571,7 @@ class Explorer(
             val snap = runCatching { capture() }.getOrNull() ?: return@repeat
             // Still on a foreign screen — press BACK again.
             if (config.targetPackage.isNotBlank() && snap.pkg != config.targetPackage) return@repeat
-            val known = fingerprintToId[snap.fingerprint]
+            val known = resolveKnownStateId(snap)
                 ?.let { id -> session.states.firstOrNull { it.id == id } }
             if (known != null) return known
         }
@@ -644,7 +654,7 @@ class Explorer(
             return returnToApp(source)
         }
 
-        val knownId = fingerprintToId[after.fingerprint]
+        val knownId = resolveKnownStateId(after)
         val result: StateEntry = when {
             knownId == source.id -> {
                 listener.onLog("  ↺ self-loop")
@@ -1006,8 +1016,9 @@ class Explorer(
         // Fingerprints recorded as "still on this state" by selection-only
         // taps (picker rotations etc.) live in [fingerprintToId] without
         // appearing in the canonical `target.fingerprint` slot — accept
-        // them here so a wheel tap doesn't trigger a costly recovery.
-        return fingerprintToId[s.fingerprint] == target.id
+        // them here so a wheel tap doesn't trigger a costly recovery. This also
+        // accepts a different toggle/scroll variant of the same root screen.
+        return resolveKnownStateId(s) == target.id
     }
 
     /**
@@ -1084,9 +1095,7 @@ class Explorer(
                 }
                 continue
             }
-            val match = snap?.fingerprint?.let { fp ->
-                fingerprintToId[fp]?.let { id -> statesById[id] }
-            }
+            val match = snap?.let { resolveKnownStateId(it) }?.let { id -> statesById[id] }
             if (match != null) {
                 if (attempt > 1) listener.onLog("  ✓ ${match.id} reached after $attempt captures")
                 return match
@@ -1323,7 +1332,53 @@ class Explorer(
         )
         session.states += entry
         structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        // Record the screen's root-container id so future captures of the same
+        // screen (different toggle / scroll / selection) resolve back to it
+        // instead of registering a near-duplicate. First writer wins.
+        StateOps.rootScreenId(snap.root, config.targetPackage)?.let { rid ->
+            rootIdToStateId.putIfAbsent(rid, id)
+        }
         return entry
+    }
+
+    /**
+     * Resolves a snapshot to an already-known state. Tries an exact fingerprint
+     * match first; failing that, falls back to the screen's *root container id*
+     * (e.g. a Compose `settings_screen` testTag) so that the same screen with a
+     * toggle flipped, a switch checked or a row scrolled into view is recognised
+     * as the SAME state instead of spawning S4…S10 duplicates. On a root-id
+     * match the new fingerprint is aliased to the known state and any
+     * freshly-revealed clickables are merged in, so they still get exercised.
+     */
+    private fun resolveKnownStateId(snap: Snapshot): String? {
+        fingerprintToId[snap.fingerprint]?.let { return it }
+        val rid = StateOps.rootScreenId(snap.root, config.targetPackage) ?: return null
+        val stateId = rootIdToStateId[rid] ?: return null
+        fingerprintToId[snap.fingerprint] = stateId
+        mergeRevealedClickables(stateId, snap)
+        return stateId
+    }
+
+    /**
+     * Absorbs clickables that a variant of an already-known screen exposes but
+     * the stored state doesn't yet have (e.g. notification sub-options revealed
+     * once a switch is on, or rows scrolled into view). Newly-seen actions are
+     * appended as un-exercised work so the frontier still visits them — this is
+     * what stops the export / import / "rate app" rows from being skipped when
+     * the settings screen collapses into a single state.
+     */
+    private fun mergeRevealedClickables(stateId: String, snap: Snapshot) {
+        val idx = session.states.indexOfFirst { it.id == stateId }
+        if (idx < 0) return
+        val existing = session.states[idx]
+        fun key(c: ClickableRef) = if (c.resourceId.isNotBlank()) "rid:${c.resourceId}" else "bnd:${c.bounds}"
+        val have = existing.clickables.mapTo(HashSet()) { key(it) }
+        val fresh = StateOps.collectClickables(snap.root, config.targetPackage, config.maxClickablesPerState)
+            .filter { key(it) !in have }
+        if (fresh.isEmpty()) return
+        session.states[idx] = existing.copy(clickables = existing.clickables + fresh)
+        planned += fresh.size
+        persist()
     }
 
     /**

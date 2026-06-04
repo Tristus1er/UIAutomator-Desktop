@@ -632,6 +632,73 @@ class ExplorerDfsTest {
     }
 
     @Test
+    fun `a screen with a root container id stays one state across toggle variants and still exercises revealed rows`() {
+        // Regression: the settings screen carries a `settings_screen` root
+        // container (Compose testTag). Flipping `notif_switch` reveals a sub-row,
+        // shifting the fingerprint but NOT the root id. The old code minted a new
+        // state for every toggle / scroll variant (S4…S10) and burned the budget
+        // there, never tapping export or the revealed row. Now it must stay ONE
+        // state, treat the toggle as a self-loop, merge the revealed row, and
+        // exercise both export and that row.
+        fun settings(on: Boolean): String {
+            val sub = if (on) {
+                """<node index="2" text="" resource-id="notif_sub" class="android.view.View" package="$pkg" content-desc="" clickable="true" enabled="true" bounds="[40,700][1040,800]"/>"""
+            } else ""
+            return """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" class="android.view.View" resource-id="settings_screen" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node index="0" text="" resource-id="notif_switch" class="android.view.View" package="$pkg" content-desc="" clickable="true" enabled="true" bounds="[40,100][1040,200]"/>
+      <node index="1" text="" resource-id="export_btn" class="android.view.View" package="$pkg" content-desc="" clickable="true" enabled="true" bounds="[40,400][1040,500]"/>
+      $sub
+    </node>
+  </node>
+</hierarchy>"""
+        }
+        val fake = FakeAdbGateway(
+            screens = mapOf(
+                "home" to FakeAdbGateway.Screen(screen("home", listOf(Btn("open_settings", 100, 100)))),
+                "settings_off" to FakeAdbGateway.Screen(settings(on = false)),
+                "settings_on" to FakeAdbGateway.Screen(settings(on = true)),
+                "export_page" to FakeAdbGateway.Screen(screen("export_page")),
+                "sub_page" to FakeAdbGateway.Screen(screen("sub_page")),
+            ),
+            tapTable = mapOf(
+                FakeAdbGateway.TapKey("home", 100, 100) to "settings_off",
+                FakeAdbGateway.TapKey("settings_off", 540, 150) to "settings_on", // notif_switch
+                FakeAdbGateway.TapKey("settings_on", 540, 150) to "settings_off",
+                FakeAdbGateway.TapKey("settings_off", 540, 450) to "export_page", // export_btn
+                FakeAdbGateway.TapKey("settings_on", 540, 450) to "export_page",
+                FakeAdbGateway.TapKey("settings_on", 540, 750) to "sub_page", // notif_sub (only when on)
+            ),
+            launchTarget = "home",
+        )
+
+        val session = runExplorer(fake)
+
+        // Exactly ONE settings state despite the on/off fingerprint difference.
+        val settingsStates = session.states.filter { s -> s.clickables.any { it.resourceId == "notif_switch" } }
+        assertEquals(1, settingsStates.size, "the settings screen must collapse to a single state across toggle variants")
+        val settingsId = settingsStates.single().id
+
+        // The toggle is a self-loop on that one state, not a fresh duplicate.
+        assertTrue(
+            session.transitions.any { it.from == settingsId && it.to == settingsId && it.loop && it.action.resourceId == "notif_switch" },
+            "flipping the switch must be a self-loop, not a new state",
+        )
+        // export_btn was exercised…
+        assertTrue(
+            session.transitions.any { it.from == settingsId && it.action.resourceId == "export_btn" && it.to != null },
+            "the export button must be exercised",
+        )
+        // …and the row revealed only when the switch is on was merged and exercised.
+        assertTrue(
+            session.transitions.any { it.from == settingsId && it.action.resourceId == "notif_sub" && it.to != null },
+            "the row revealed by the toggle must be merged in and exercised",
+        )
+    }
+
+    @Test
     fun `permission flow bouncing through Settings is backed out to the app`() {
         // Some apps (Laqi does this for location) deep-link the permission
         // request through the system Settings app: the runtime dialog appears

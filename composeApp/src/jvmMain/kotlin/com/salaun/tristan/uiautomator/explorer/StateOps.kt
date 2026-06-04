@@ -446,6 +446,51 @@ object StateOps {
     }
 
     /**
+     * The resource-id of the screen's outermost *application* container — e.g. a
+     * Compose `settings_screen` testTag that wraps the whole page. Serves as a
+     * stable screen identity: the same screen captured with a toggle flipped, a
+     * switch checked, or a row scrolled into view keeps the same root id even
+     * though its structural fingerprint shifts — so the explorer can recognise
+     * it as ONE state instead of minting a near-duplicate for every variation.
+     *
+     * Selection rule: the largest-area node, top-down, whose resource-id is
+     * non-blank, is NOT a framework id (`android:` / `com.android.` — e.g.
+     * `android:id/content`, the decor content frame shared by every screen),
+     * belongs to the target package, and blankets most of the screen. Returns
+     * null when no such container exists (system dialogs, foreign screens), in
+     * which case the caller falls back to the structural fingerprint.
+     */
+    fun rootScreenId(root: UiNode, pkgFilter: String): String? {
+        val screenArea = root.bounds?.area ?: return null
+        if (screenArea <= 0L) return null
+        var best: String? = null
+        var bestArea = 0L
+        root.walk { n ->
+            val rid = n.resourceId
+            if (rid.isBlank() || isFrameworkResourceId(rid)) return@walk
+            if (pkgFilter.isNotBlank() && n.packageName.isNotBlank() && n.packageName != pkgFilter) return@walk
+            val area = n.bounds?.area ?: return@walk
+            // Must blanket most of the screen to count as its root container,
+            // not merely some large inner panel.
+            if (area * 5 < screenArea * 3) return@walk // < 60% of the screen
+            if (area > bestArea) {
+                bestArea = area
+                best = rid
+            }
+        }
+        return best
+    }
+
+    /**
+     * `android:id/content` (the decor content frame) and other platform ids are
+     * shared by every screen, so they can never identify one. App ids — whether
+     * a Compose testTag like `settings_screen` or a view id `pkg:id/foo` — are
+     * not framework ids.
+     */
+    private fun isFrameworkResourceId(rid: String): Boolean =
+        rid.startsWith("android:") || rid.startsWith("com.android.")
+
+    /**
      * Same-shape variant of [fingerprint] that ignores text and content-desc.
      * Two screens with identical class + resource-id + clickable + child-count
      * trees share the same structure fingerprint even if their copy differs.
