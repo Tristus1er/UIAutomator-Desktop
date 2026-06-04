@@ -27,6 +27,11 @@ import com.salaun.tristan.uiautomator.i18n.Strings
 import com.salaun.tristan.uiautomator.i18n.Translations
 import com.salaun.tristan.uiautomator.model.DumpParser
 import com.salaun.tristan.uiautomator.model.UiNode
+import com.salaun.tristan.uiautomator.rules.PackageRuleSummary
+import com.salaun.tristan.uiautomator.rules.RuleEngine
+import com.salaun.tristan.uiautomator.rules.RuleStore
+import com.salaun.tristan.uiautomator.rules.RuleZip
+import com.salaun.tristan.uiautomator.rules.ScreenRule
 import com.salaun.tristan.uiautomator.settings.AppSettings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -35,7 +40,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-enum class Screen { Main, Settings, Explorer, ManualExplorer, Graph, Sessions }
+enum class Screen { Main, Settings, Explorer, ManualExplorer, Graph, Sessions, Rules, RulePackage, RuleEdit }
 
 class AppState(
     val settings: AppSettings,
@@ -125,6 +130,18 @@ class AppState(
      */
     var manualScrollCapture: ScrollCapture.Stitched? by mutableStateOf(null, neverEqualPolicy())
 
+    // -- Custom screen rules --------------------------------------------------
+    // The rule library is global (shared across sessions). These properties
+    // drive the three rule screens: the package list, a package's rule list,
+    // and the capture-based rule editor.
+    val ruleStore = RuleStore()
+    var selectedRulePackage: String? by mutableStateOf(null)
+    /** Rule currently being edited; null while editing means "new rule". */
+    var editingRule: ScreenRule? by mutableStateOf(null)
+    var ruleEditPackage: String by mutableStateOf("")
+    /** Bumped after each rule mutation so the list screens recompose. */
+    var ruleRevision: Int by mutableStateOf(0)
+
     fun initialize() {
         if (adbPath.isBlank()) {
             com.salaun.tristan.uiautomator.adb.AdbAutoDetect.detect()?.let {
@@ -180,6 +197,9 @@ class AppState(
     fun refreshDevices() {
         if (adbPath.isBlank()) return
         scope.launch {
+            // Clear any stale error from a previous attempt so a successful
+            // retry doesn't leave the old "timed out" message on screen.
+            errorMessage = null
             try {
                 val list = adb.listDevices()
                 devices.clear()
@@ -393,7 +413,7 @@ class AppState(
         if (pkg.isBlank()) { errorMessage = strings.explorerErrorNoPackage; return }
         val serial = selectedSerial
         val store = SessionStore.create(SessionStore.defaultRoot(), pkg)
-        val explorer = Explorer(adb, serial, explorerConfig, store)
+        val explorer = Explorer(adb, serial, explorerConfig, store, RuleEngine(ruleStore))
         explorerLog.clear()
         explorerProgress = null
         explorerSession = null
@@ -763,6 +783,97 @@ class AppState(
                 if (openAfter) loadSessionFromDir(imported)
             } catch (e: Exception) {
                 errorMessage = strings.sessionsImportFailedFmt.format(e.message ?: e::class.simpleName.orEmpty())
+            }
+        }
+    }
+
+    // --- Custom screen rules -------------------------------------------------
+
+    fun listRulePackages(): List<PackageRuleSummary> = ruleStore.listPackages()
+
+    fun rulesFor(pkg: String): List<ScreenRule> = ruleStore.load(pkg).rules.toList()
+
+    fun openRulePackage(pkg: String) {
+        selectedRulePackage = pkg
+        go(Screen.RulePackage)
+    }
+
+    /** Starts editing a brand-new rule for [pkg]. */
+    fun startNewRule(pkg: String) {
+        editingRule = null
+        ruleEditPackage = pkg
+        go(Screen.RuleEdit)
+    }
+
+    fun editRule(pkg: String, rule: ScreenRule) {
+        editingRule = rule
+        ruleEditPackage = pkg
+        go(Screen.RuleEdit)
+    }
+
+    /** Upserts [rule] into [pkg]'s rule set (matched by id) and persists. */
+    fun saveRule(pkg: String, rule: ScreenRule) {
+        val set = ruleStore.load(pkg)
+        val idx = set.rules.indexOfFirst { it.id == rule.id }
+        if (idx >= 0) set.rules[idx] = rule else set.rules.add(rule)
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    fun deleteRule(pkg: String, ruleId: String) {
+        val set = ruleStore.load(pkg)
+        set.rules.removeAll { it.id == ruleId }
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    /** Toggles a rule's enabled flag in-place and persists. */
+    fun setRuleEnabled(pkg: String, ruleId: String, enabled: Boolean) {
+        val set = ruleStore.load(pkg)
+        val idx = set.rules.indexOfFirst { it.id == ruleId }
+        if (idx < 0) return
+        set.rules[idx] = set.rules[idx].copy(enabled = enabled, updatedAt = System.currentTimeMillis())
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    /** Moves a rule up/down to change first-match priority. */
+    fun moveRule(pkg: String, ruleId: String, delta: Int) {
+        val set = ruleStore.load(pkg)
+        val idx = set.rules.indexOfFirst { it.id == ruleId }
+        if (idx < 0) return
+        val target = (idx + delta).coerceIn(0, set.rules.lastIndex)
+        if (target == idx) return
+        val rule = set.rules.removeAt(idx)
+        set.rules.add(target, rule)
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    fun deleteRulePackage(pkg: String) {
+        ruleStore.delete(pkg)
+        ruleRevision++
+    }
+
+    fun exportRulePackage(pkg: String, outFile: java.io.File) {
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { RuleZip.exportPackage(ruleStore, pkg, outFile) }
+                statusMessage = strings.rulesExportedFmt.format(outFile.absolutePath)
+            } catch (e: Exception) {
+                errorMessage = strings.rulesExportFailedFmt.format(e.message ?: e::class.simpleName.orEmpty())
+            }
+        }
+    }
+
+    fun importRulePackage(zipFile: java.io.File) {
+        scope.launch {
+            try {
+                val pkg = withContext(Dispatchers.IO) { RuleZip.importPackage(zipFile, ruleStore) }
+                ruleRevision++
+                statusMessage = strings.rulesImportedFmt.format(pkg)
+            } catch (e: Exception) {
+                errorMessage = strings.rulesImportFailedFmt.format(e.message ?: e::class.simpleName.orEmpty())
             }
         }
     }

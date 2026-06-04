@@ -62,6 +62,13 @@ class Explorer(
     private val serial: String?,
     private val config: ExplorationConfig,
     private val store: SessionStore,
+    /**
+     * Optional custom-rule engine. When non-null and the target package has
+     * rules, the explorer applies a matching rule's routine with priority over
+     * its generic heuristics on every freshly-landed screen (see [tryApplyRule]).
+     * Defaults to `null` so existing call sites and tests are unaffected.
+     */
+    private val ruleEngine: com.salaun.tristan.uiautomator.rules.RuleEngine? = null,
 ) {
 
     interface Listener {
@@ -97,6 +104,13 @@ class Explorer(
      * tap on a picker / list / grid cell — see [isSelectionWithinSameScreen].
      */
     private val structureFingerprintByStateId = HashMap<String, String>()
+    /**
+     * Per-state set of app resource-ids. Used to reject a root-id dedup merge
+     * when the candidate screen barely overlaps the known one — i.e. two
+     * unrelated screens sharing a generic app-shell container (`root_app`)
+     * rather than two variants of the same screen.
+     */
+    private val resourceIdsByStateId = HashMap<String, Set<String>>()
     private var processed = 0
     private var planned = 0
 
@@ -133,6 +147,11 @@ class Explorer(
             config = config,
         )
         listener.onLog("Session: ${store.baseDir.absolutePath}")
+
+        pkgRules = ruleEngine?.rulesFor(config.targetPackage).orEmpty()
+        if (pkgRules.isNotEmpty()) {
+            listener.onLog("📐 ${pkgRules.size} custom screen rule(s) loaded for ${config.targetPackage}")
+        }
 
         // Freeze the system status bar BEFORE the first capture so the very
         // first fingerprint already reflects a stable clock / battery / signal.
@@ -254,6 +273,29 @@ class Explorer(
      */
     private val exhaustedStates = HashSet<String>()
 
+    /** Custom screen rules for the target package, loaded once at the start of [run]. */
+    private var pkgRules: List<com.salaun.tristan.uiautomator.rules.ScreenRule> = emptyList()
+
+    /**
+     * State ids for which a custom rule has already been considered. Used only
+     * as the cheap first gate so revisiting a state without the live screen
+     * changing pays no extra capture.
+     */
+    private val ruleHandledStates = HashSet<String>()
+
+    /**
+     * Exact fingerprints of the live screens already rule-checked. This is the
+     * real guard: it lets the hook re-evaluate rules whenever the *physical*
+     * screen differs, even when several physically-distinct screens collapse to
+     * the same state id (apps that wrap every onboarding step in one shared
+     * full-screen container dedupe to a single state via its root id, which
+     * would otherwise let only the first step ever be rule-checked).
+     */
+    private val ruleCheckedFingerprints = HashSet<String>()
+
+    /** Fingerprint of the most recent [capture]; what the device physically shows now. */
+    private var lastLiveFingerprint: String? = null
+
     /**
      * Ids of captured permission-dialog screens. They are **one-time**: once
      * granted, the system never shows them again, so navigation must NOT route
@@ -318,6 +360,24 @@ class Explorer(
         while (coroutineContext.isActive && session.states.size < config.maxStates) {
             current = session.states.firstOrNull { it.id == current.id } ?: current
 
+            // 0. Custom screen rules take priority over the generic heuristics.
+            //    When a rule matches the freshly-landed screen, its routine is
+            //    executed and the screen is treated as fully handled (strict
+            //    pass-through — its other clickables are NOT exercised). The
+            //    check fires when this is a new state OR when the device's live
+            //    screen (fingerprint) hasn't been rule-checked yet — the latter
+            //    catches physically-distinct screens that deduped to a known id.
+            if (pkgRules.isNotEmpty() &&
+                (current.id !in ruleHandledStates ||
+                    lastLiveFingerprint?.let { it !in ruleCheckedFingerprints } == true)
+            ) {
+                val landed = tryApplyRule(current)
+                if (landed != null) {
+                    current = landed
+                    continue
+                }
+            }
+
             // 1. Anything left to try on the current screen?
             if (current.id !in exhaustedStates && branchDepth(current.id) < config.maxDepth) {
                 prepareStateForExploration(current)
@@ -353,6 +413,105 @@ class Explorer(
                     exhaustedStates += target.id
                 }
             }
+        }
+    }
+
+    /**
+     * Applies a custom screen rule to [current] when one matches the live
+     * screen. Returns the state the device ends up on after the rule's routine
+     * (a new child, a known screen, or `null` to fall through to the generic
+     * explorer). Strict pass-through: when the routine moves the app forward,
+     * [current] is marked exhausted so its other clickables are never exercised.
+     *
+     * The method is gated by [ruleHandledStates] so a rule fires at most once
+     * per state, and falls through (returns `null`) when the routine leaves the
+     * screen unchanged — the primary guard against a rule looping forever on its
+     * own screen.
+     */
+    private suspend fun tryApplyRule(current: StateEntry): StateEntry? {
+        val engine = ruleEngine ?: return null
+        // Re-dump the live screen: rule matching must see what's on screen now,
+        // not the on-disk XML captured when we first landed here.
+        val snap = runCatching { capture() }.getOrNull() ?: run {
+            ruleHandledStates += current.id
+            return null
+        }
+        ruleHandledStates += current.id
+        // Guard on the *live* fingerprint, not the state id: a screen that
+        // deduped into a known state still gets one rule evaluation here.
+        if (snap.fingerprint in ruleCheckedFingerprints) return null
+        ruleCheckedFingerprints += snap.fingerprint
+        if (config.targetPackage.isNotBlank() && snap.pkg != config.targetPackage) return null
+        val rule = engine.matchRule(snap.root, config.targetPackage, pkgRules) ?: return null
+
+        listener.onLog("📐 rule « ${rule.name} » matches ${current.id} — applying routine (${rule.routine.size} actions)")
+        val ruleAction = ClickableRef(
+            resourceId = "", className = "RULE", text = rule.name, contentDesc = "",
+            bounds = SerialBounds(0, 0, 0, 0), tapX = 0, tapY = 0,
+        )
+        // Source of the next recorded edge. Advances each time a screen is
+        // registered (a Capture step, or the routine's final screen), so the
+        // routine appears as a chain S_from → step1 → step2 → final instead of
+        // a single edge — surfacing transient dialogs / intermediate screens.
+        var stepFrom = session.states.firstOrNull { it.id == current.id } ?: current
+
+        suspend fun registerStep(stepSnap: Snapshot): StateEntry? {
+            if (config.targetPackage.isNotBlank() && stepSnap.pkg != config.targetPackage) return null
+            val known = resolveKnownStateId(stepSnap)
+            val st = if (known != null) {
+                session.states.firstOrNull { it.id == known }
+            } else {
+                registerState(stepSnap, depth = stepFrom.depth + 1, path = stepFrom.pathFromRoot + ruleAction).also {
+                    fingerprintToId[stepSnap.fingerprint] = it.id
+                    planned += it.clickables.size
+                    listener.onLog("  → new ${it.id} (${it.clickables.size} actions)")
+                }
+            }
+            if (st != null && st.id != stepFrom.id) {
+                session.transitions += TransitionEntry(stepFrom.id, st.id, ruleAction)
+                backLeadsTo[st.id] = stepFrom.id
+                stepFrom = st
+                emit(st.id, "RULE « ${rule.name} »")
+                persist()
+            }
+            return st
+        }
+
+        val outcome = engine.execute(
+            rule, adb, serial, config.settleDelayMs,
+            onCaptureStep = {
+                val mid = runCatching { waitOutLongOperation(capture()) }.getOrNull()
+                if (mid != null) {
+                    registerStep(mid)
+                    listener.onLog("    📸 capture step → ${stepFrom.id}")
+                }
+            },
+        ) { listener.onLog("    $it") }
+        when (outcome) {
+            is com.salaun.tristan.uiautomator.rules.RuleOutcome.Completed ->
+                listener.onLog("  ✓ rule « ${rule.name} » completed (${outcome.actionsRun} actions)")
+            is com.salaun.tristan.uiautomator.rules.RuleOutcome.Aborted ->
+                listener.onLog("  ⚠ rule « ${rule.name} » aborted at action ${outcome.atAction}: ${outcome.reason}")
+        }
+
+        val after = runCatching { waitOutLongOperation(capture()) }.getOrNull()
+            ?: return reanchor() ?: returnToApp(current)
+        val finalState = registerStep(after)
+
+        return if (finalState != null && finalState.id != current.id) {
+            // Pass-through: the routine moved the app forward, so the matched
+            // screen is done — its generic clickables are not exercised.
+            exhaustedStates += current.id
+            finalState
+        } else {
+            // The routine left us on the matched screen (no Capture steps moved
+            // us either). Record a self-loop and fall through to generic
+            // exploration — the guard against a rule looping on its own screen.
+            if (stepFrom.id == current.id) {
+                session.transitions += TransitionEntry(current.id, current.id, ruleAction, loop = true)
+                persist()
+            }
+            null
         }
     }
 
@@ -660,6 +819,21 @@ class Explorer(
                 listener.onLog("  ↺ self-loop")
                 session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
                 source
+            }
+            knownId != null && shouldFanOutDetail(source, click, knownId, after) -> {
+                // A bare media screen (video / full-bleed image) reached again
+                // from the same menu via a different item: structurally identical
+                // to its siblings but a distinct screenshot. Register a separate
+                // state per entry so each video / image gets its own node, and
+                // mark it exhausted (the layout is identical — nothing new to
+                // explore). The fingerprint stays aliased to the canonical state,
+                // so the next sibling fans out the same way.
+                val clone = registerState(after, depth = source.depth + 1, path = source.pathFromRoot + click)
+                session.transitions += TransitionEntry(source.id, clone.id, click)
+                backLeadsTo[clone.id] = source.id
+                exhaustedStates += clone.id
+                listener.onLog("  ✶ detail fan-out → new ${clone.id} (same layout, distinct screenshot)")
+                clone
             }
             knownId != null -> {
                 listener.onLog("  → known state $knownId")
@@ -1308,7 +1482,9 @@ class Explorer(
         val xml = adb.dumpUiXml(serial)
         val root = DumpParser.parse(xml) ?: error("Invalid UIAutomator dump")
         val pkg = StateOps.dominantPackage(root)
-        return Snapshot(idle.png, xml, root, pkg, StateOps.fingerprint(root))
+        val fp = StateOps.fingerprint(root)
+        lastLiveFingerprint = fp
+        return Snapshot(idle.png, xml, root, pkg, fp)
     }
 
     private fun registerState(
@@ -1332,6 +1508,7 @@ class Explorer(
         )
         session.states += entry
         structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        resourceIdsByStateId[id] = StateOps.screenResourceIds(snap.root, config.targetPackage)
         // Record the screen's root-container id so future captures of the same
         // screen (different toggle / scroll / selection) resolve back to it
         // instead of registering a near-duplicate. First writer wins.
@@ -1354,9 +1531,27 @@ class Explorer(
         fingerprintToId[snap.fingerprint]?.let { return it }
         val rid = StateOps.rootScreenId(snap.root, config.targetPackage) ?: return null
         val stateId = rootIdToStateId[rid] ?: return null
+        // The root-container id matches a known state, but that alone over-merges
+        // when the id is a generic app shell (e.g. `root_app`) shared by unrelated
+        // screens. Only treat this as the same screen when the two share most of
+        // their resource-ids — toggle / scroll variants of one screen do; FAQ vs
+        // About vs a video player inside the same shell do not.
+        val knownIds = resourceIdsByStateId[stateId]
+        if (knownIds != null && knownIds.isNotEmpty()) {
+            val newIds = StateOps.screenResourceIds(snap.root, config.targetPackage)
+            if (jaccard(knownIds, newIds) < ROOT_MERGE_MIN_JACCARD) return null
+        }
         fingerprintToId[snap.fingerprint] = stateId
         mergeRevealedClickables(stateId, snap)
         return stateId
+    }
+
+    /** Overlap ratio |A∩B| / |A∪B|; 0 when both sets are empty. */
+    private fun jaccard(a: Set<String>, b: Set<String>): Double {
+        if (a.isEmpty() && b.isEmpty()) return 0.0
+        val inter = a.count { it in b }
+        val union = a.size + b.size - inter
+        return if (union == 0) 0.0 else inter.toDouble() / union
     }
 
     /**
@@ -1389,6 +1584,26 @@ class Explorer(
      * small tab bars whose target screens happen to share the source's DOM
      * skeleton would all collapse into self-loops, hiding real navigation.
      */
+    /**
+     * `true` when the tap landed on a *bare media* screen (see
+     * [StateOps.isBareMediaScreen]) that has already been reached from [source]
+     * via a **different** element — i.e. a list/menu whose items each open a
+     * structurally-identical full-screen video / image. Those screens are
+     * indistinguishable in the accessibility tree (only the pixels differ), so
+     * fingerprint dedup would collapse them into one node; this lets each entry
+     * keep its own state and screenshot. Dismiss / back affordances are excluded
+     * so closing such a screen does not spawn a clone.
+     */
+    private fun shouldFanOutDetail(source: StateEntry, click: ClickableRef, knownId: String, after: Snapshot): Boolean {
+        if (knownId == source.id) return false
+        if (StateOps.isLikelyDismissAction(click)) return false
+        if (!StateOps.isBareMediaScreen(after.root, config.targetPackage)) return false
+        return session.transitions.any { t ->
+            t.from == source.id && t.to == knownId && !t.loop && !t.leftApp &&
+                t.errorMessage == null && t.action.resourceId != click.resourceId
+        }
+    }
+
     private fun isSelectionWithinSameScreen(source: StateEntry, click: ClickableRef, after: Snapshot): Boolean {
         if (click.siblingGroupSize < pickerSiblingThreshold) return false
         val sourceStructure = structureFingerprintByStateId[source.id] ?: return false
@@ -1439,5 +1654,13 @@ class Explorer(
 
         /** Poll interval while waiting out a long-running operation screen. */
         const val LONG_OP_POLL_MS = 3_000L
+
+        /**
+         * Minimum resource-id overlap (Jaccard) for two screens that share a
+         * root-container id to be merged into one state. Above it: toggle /
+         * scroll variants of the same screen (they share nearly all ids). Below
+         * it: distinct screens that merely share a generic app-shell container.
+         */
+        const val ROOT_MERGE_MIN_JACCARD = 0.5
     }
 }

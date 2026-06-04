@@ -453,17 +453,27 @@ object StateOps {
      * though its structural fingerprint shifts — so the explorer can recognise
      * it as ONE state instead of minting a near-duplicate for every variation.
      *
-     * Selection rule: the largest-area node, top-down, whose resource-id is
-     * non-blank, is NOT a framework id (`android:` / `com.android.` — e.g.
-     * `android:id/content`, the decor content frame shared by every screen),
-     * belongs to the target package, and blankets most of the screen. Returns
-     * null when no such container exists (system dialogs, foreign screens), in
-     * which case the caller falls back to the structural fingerprint.
+     * Selection rule: among the nodes that blanket most of the screen, carry a
+     * non-blank, non-framework (`android:` / `com.android.` — e.g.
+     * `android:id/content`, the decor content frame shared by every screen)
+     * id and belong to the target package, the **deepest** one wins (ties broken
+     * by larger area). Returns null when no such container exists (system
+     * dialogs, foreign screens), in which case the caller falls back to the
+     * structural fingerprint.
+     *
+     * Why deepest, not largest: single-Activity / Compose apps wrap every screen
+     * in one shared full-screen shell (a `root_app`, a nav host) that spans the
+     * whole screen on *every* page. Picking that outermost shell would give the
+     * same root id to every fragment and collapse the entire app into one state.
+     * The real per-screen container sits deeper inside the shell and carries a
+     * screen-specific id, so descending to the deepest screen-filling container
+     * distinguishes the fragments while still ignoring small inner widgets.
      */
     fun rootScreenId(root: UiNode, pkgFilter: String): String? {
         val screenArea = root.bounds?.area ?: return null
         if (screenArea <= 0L) return null
         var best: String? = null
+        var bestDepth = -1
         var bestArea = 0L
         root.walk { n ->
             val rid = n.resourceId
@@ -473,7 +483,8 @@ object StateOps {
             // Must blanket most of the screen to count as its root container,
             // not merely some large inner panel.
             if (area * 5 < screenArea * 3) return@walk // < 60% of the screen
-            if (area > bestArea) {
+            if (n.depth > bestDepth || (n.depth == bestDepth && area > bestArea)) {
+                bestDepth = n.depth
                 bestArea = area
                 best = rid
             }
@@ -517,6 +528,51 @@ object StateOps {
         }
         visit(root)
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * The set of app-owned, non-framework resource-ids present on the screen.
+     * Used to tell whether two screens that share a root-container id (e.g. a
+     * generic app shell like `root_app`) are really the same screen or two
+     * unrelated screens that merely live inside the same shell — the former
+     * share most of their ids, the latter almost none.
+     */
+    fun screenResourceIds(root: UiNode, pkgFilter: String): Set<String> {
+        val out = HashSet<String>()
+        root.walk { n ->
+            val rid = n.resourceId
+            if (rid.isBlank() || isFrameworkResourceId(rid)) return@walk
+            if (pkgFilter.isNotBlank() && n.packageName.isNotBlank() && n.packageName != pkgFilter) return@walk
+            out += rid
+        }
+        return out
+    }
+
+    /**
+     * `true` when [root] is a *bare media surface*: no readable text, no
+     * content-description, and no app-owned id'd widget smaller than the screen
+     * (only full-screen containers carry ids). A full-screen video player or a
+     * full-bleed image detail looks like this — structurally identical to its
+     * siblings, distinguishable only by the pixels in the screenshot. The
+     * explorer uses this to decide that several such screens reached from one
+     * menu are distinct states (one screenshot each) rather than one merged
+     * state. The strict "no small id'd widget" clause keeps ordinary detail
+     * screens (which carry labels / buttons / a back affordance with ids) out.
+     */
+    fun isBareMediaScreen(root: UiNode, pkgFilter: String): Boolean {
+        val screenArea = root.bounds?.area ?: return false
+        if (screenArea <= 0L) return false
+        if (hasMeaningfulText(root)) return false
+        var hasSmallIdWidget = false
+        root.walk { n ->
+            if (hasSmallIdWidget) return@walk
+            val rid = n.resourceId
+            if (rid.isBlank() || isFrameworkResourceId(rid)) return@walk
+            if (pkgFilter.isNotBlank() && n.packageName.isNotBlank() && n.packageName != pkgFilter) return@walk
+            val area = n.bounds?.area ?: return@walk
+            if (area * 5 < screenArea * 3) hasSmallIdWidget = true // an id'd widget below 60% of the screen
+        }
+        return !hasSmallIdWidget
     }
 
     fun dominantPackage(root: UiNode): String {

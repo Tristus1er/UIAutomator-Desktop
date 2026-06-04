@@ -99,6 +99,7 @@ private fun Toolbar(state: AppState) {
             ToolbarNavButton(strings.toolbarExplorer, onClick = { state.go(Screen.Explorer) })
             ToolbarNavButton(strings.manualToolbarLabel, onClick = { state.go(Screen.ManualExplorer) })
             ToolbarNavButton(strings.toolbarSessions, onClick = { state.go(Screen.Sessions) })
+            ToolbarNavButton(strings.toolbarRules, onClick = { state.go(Screen.Rules) })
             if (state.explorerSession != null) {
                 ToolbarNavButton(strings.toolbarGraph, onClick = { state.go(Screen.Graph) })
             }

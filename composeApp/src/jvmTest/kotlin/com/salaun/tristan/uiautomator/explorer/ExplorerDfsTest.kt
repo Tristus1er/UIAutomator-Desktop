@@ -896,6 +896,95 @@ class ExplorerDfsTest {
     }
 
     @Test
+    fun `screens sharing a generic app-shell container are not merged into one state`() {
+        // home opens FAQ and About. Both wrap in the SAME full-screen "root_app"
+        // shell (so rootScreenId resolves to root_app for both) but have entirely
+        // different content. They must register as two distinct states, not
+        // collapse into one via the shared shell id.
+        fun shell(titleId: String, bodyId: String) = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.view.View" resource-id="root_app" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node class="android.widget.TextView" resource-id="$titleId" text="t" package="$pkg" clickable="false" enabled="true" bounds="[40,100][1040,200]"/>
+      <node class="android.widget.TextView" resource-id="$bodyId" text="b" package="$pkg" clickable="false" enabled="true" bounds="[40,300][1040,1000]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        val homeXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.view.View" resource-id="home_screen" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node class="android.widget.Button" resource-id="$pkg:id/faq" text="FAQ" package="$pkg" clickable="true" enabled="true" bounds="[40,100][1040,200]"/>
+      <node class="android.widget.Button" resource-id="$pkg:id/about" text="About" package="$pkg" clickable="true" enabled="true" bounds="[40,300][1040,400]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        val fake = FakeAdbGateway(
+            screens = mapOf(
+                "home" to FakeAdbGateway.Screen(homeXml),
+                "faq" to FakeAdbGateway.Screen(shell("faq_title", "faq_body")),
+                "about" to FakeAdbGateway.Screen(shell("about_title", "about_body")),
+            ),
+            tapTable = mapOf(
+                FakeAdbGateway.TapKey("home", 540, 150) to "faq",
+                FakeAdbGateway.TapKey("home", 540, 350) to "about",
+            ),
+            launchTarget = "home",
+        )
+
+        val session = runExplorer(fake)
+
+        assertEquals(3, session.states.size, "home + FAQ + About — the shared shell must not merge FAQ and About")
+        val targets = session.transitions.filter { it.from == "S0" && it.to != null }.mapNotNull { it.to }.toSet()
+        assertEquals(setOf("S1", "S2"), targets, "FAQ and About are distinct destinations")
+    }
+
+    @Test
+    fun `bare media screens reached from one menu fan out into one state per entry`() {
+        // A tutorial menu with three buttons, each playing a full-screen video.
+        // The video screen carries no text and no id'd widget (a bare media
+        // surface) — all three captures are byte-identical in the tree, so
+        // fingerprint dedup would collapse them. Fan-out gives each its own
+        // state (and screenshot) instead.
+        val menuXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.view.View" resource-id="tutorial_menu" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node class="android.widget.Button" resource-id="$pkg:id/vid_a" package="$pkg" clickable="true" enabled="true" bounds="[40,100][1040,200]"/>
+      <node class="android.widget.Button" resource-id="$pkg:id/vid_b" package="$pkg" clickable="true" enabled="true" bounds="[40,300][1040,400]"/>
+      <node class="android.widget.Button" resource-id="$pkg:id/vid_c" package="$pkg" clickable="true" enabled="true" bounds="[40,500][1040,600]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        // Bare media: only the full-screen shell, no text, no id'd widgets.
+        val videoXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.view.View" resource-id="root_app" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]"/>
+  </node>
+</hierarchy>"""
+        val fake = FakeAdbGateway(
+            screens = mapOf(
+                "menu" to FakeAdbGateway.Screen(menuXml),
+                "video" to FakeAdbGateway.Screen(videoXml),
+            ),
+            tapTable = mapOf(
+                FakeAdbGateway.TapKey("menu", 540, 150) to "video",
+                FakeAdbGateway.TapKey("menu", 540, 350) to "video",
+                FakeAdbGateway.TapKey("menu", 540, 550) to "video",
+            ),
+            launchTarget = "menu",
+        )
+
+        val session = runExplorer(fake)
+
+        assertEquals(4, session.states.size, "menu + one distinct video state per button")
+        val videoEdges = session.transitions.filter { it.from == "S0" && it.action.resourceId.contains("/vid_") }
+        assertEquals(3, videoEdges.size)
+        assertEquals(3, videoEdges.mapNotNull { it.to }.toSet().size, "each video button leads to its own state")
+    }
+
+    @Test
     fun `recovery climbs back with multiple BACKs instead of relaunching`() {
         // Returning from pageA needs TWO BACKs (an interstitial overlay sits
         // between it and home). The old "single BACK else relaunch" path would

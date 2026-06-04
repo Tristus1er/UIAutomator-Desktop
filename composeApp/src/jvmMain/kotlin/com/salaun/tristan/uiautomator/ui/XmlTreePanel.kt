@@ -62,6 +62,12 @@ fun XmlTreePanel(
     modifier: Modifier = Modifier,
     /** Replaces the whole expanded set — used by expand-all / collapse-all and deep double-click toggle. */
     onExpandedChange: (Set<UiNode>) -> Unit = {},
+    /**
+     * Fired only on a deliberate *click* of a row (not on hover or keyboard
+     * navigation). The rule editor uses it to fill the active field/selector
+     * from the picked node without reacting to every hover. No-op by default.
+     */
+    onNodeClicked: (UiNode) -> Unit = {},
 ) {
     val rows: List<TreeRow> by remember(root) {
         derivedStateOf { buildRows(root, expanded) }
@@ -215,6 +221,7 @@ fun XmlTreePanel(
                             onHover = { handleRowHover(row.node) },
                             onSelect = {
                                 onSelect(row.node)
+                                onNodeClicked(row.node)
                                 pinned = true
                                 lastHoveredNode = row.node
                                 // Take focus on click so Up/Down arrows are
@@ -328,7 +335,20 @@ private fun DetailsPanel(node: UiNode?) {
                     )
                     for ((k, v) in shown) {
                         if (v.isBlank()) continue
-                        Row {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Left-click copies the value to the clipboard. This is
+                            // a reliable alternative to the SelectionContainer's
+                            // right-click menu, which on Compose Desktop can drop
+                            // the (hover-driven) selection before the copy lands.
+                            Text(
+                                "⧉",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .testTag("copy-$k")
+                                    .clickable { copyTextToClipboard(v) }
+                                    .padding(end = 4.dp),
+                            )
                             Text(
                                 "$k: ",
                                 style = MaterialTheme.typography.bodySmall,

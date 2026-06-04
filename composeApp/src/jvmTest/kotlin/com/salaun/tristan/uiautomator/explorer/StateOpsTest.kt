@@ -127,6 +127,28 @@ class StateOpsTest {
     }
 
     @Test
+    fun `rootScreenId prefers the deepest screen-filling container over a shared app shell`() {
+        // A single-Activity / Compose app wraps every screen in one full-screen
+        // "root_app" shell. The per-screen fragment container sits deeper and is
+        // also full-screen. rootScreenId must return the DEEPEST one (the fragment)
+        // so two screens sharing the same shell don't collapse into one state.
+        fun screen(fragmentId: String) = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" resource-id="android:id/content" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node index="0" class="android.view.View" resource-id="root_app" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node index="0" class="android.view.View" resource-id="$fragmentId" package="com.example.app" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+        <node index="0" class="android.widget.TextView" resource-id="com.example.app:id/title" text="x" package="com.example.app" clickable="false" enabled="true" bounds="[40,100][1040,200]"/>
+      </node>
+    </node>
+  </node>
+</hierarchy>"""
+        val welcome = assertNotNull(DumpParser.parse(screen("welcome_screen")))
+        val licence = assertNotNull(DumpParser.parse(screen("licence_screen")))
+        assertEquals("welcome_screen", StateOps.rootScreenId(welcome, "com.example.app"))
+        assertEquals("licence_screen", StateOps.rootScreenId(licence, "com.example.app"))
+    }
+
+    @Test
     fun `rootScreenId is null when no full-screen app container exists`() {
         // A dialog: only the framework frame spans the screen; the dialog body
         // is a small panel. No app-owned full-screen container → null, so the

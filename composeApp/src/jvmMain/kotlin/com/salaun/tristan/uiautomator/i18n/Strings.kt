@@ -36,6 +36,7 @@ data class Strings(
     val toolbarSessions: String,
     val toolbarGraph: String,
     val toolbarSettings: String,
+    val toolbarRules: String,
 
     // -- Screenshot panel -----------------------------------------------------
     val screenshotHint: String,
@@ -197,4 +198,76 @@ data class Strings(
     val detailDestLoopFmt: String, // "↺ Loop on the same state (%s)."
     val detailDestGoFmt: String, // "→ %s"
     val detailOpenState: String,
+
+    // -- Rules: package list screen ------------------------------------------
+    val rulesTitle: String,
+    val rulesNone: String,
+    val rulesPackageStatsFmt: String, // "%1$d rules · %2$d enabled · %3$d actions"
+    val rulesNewPackage: String,
+    val rulesNewPackageHint: String,
+    val rulesImportDialogTitle: String,
+    val rulesExportDialogTitle: String,
+    val rulesImportedFmt: String, // "Rules imported: %s"
+    val rulesImportFailedFmt: String, // "Rule import failed: %s"
+    val rulesExportedFmt: String, // "Rules exported: %s"
+    val rulesExportFailedFmt: String, // "Rule export failed: %s"
+    val rulesDeletePackageConfirmTitle: String,
+    val rulesDeletePackageConfirmBodyFmt: String, // "%s"
+
+    // -- Rules: package detail screen ----------------------------------------
+    val rulePackageTitleFmt: String, // "Rules · %s"
+    val ruleAddScreen: String,
+    val rulePackageNoRules: String,
+    val ruleEnabledLabel: String,
+    val ruleActionsCountFmt: String, // "%d actions"
+    val ruleMoveUp: String,
+    val ruleMoveDown: String,
+    val ruleDeleteConfirmTitle: String,
+    val ruleDeleteConfirmBodyFmt: String, // "%s"
+
+    // -- Rules: editor screen -------------------------------------------------
+    val ruleEditTitleNew: String,
+    val ruleEditTitleEdit: String,
+    val ruleEditPickHint: String,
+    val ruleNameLabel: String,
+    val ruleCaptureButton: String,
+    val ruleSignatureSection: String,
+    val ruleSignaturePickHint: String,
+    val ruleSignatureEmpty: String,
+    val ruleSignatureUseRootId: String,
+    val ruleSignatureAddResourceId: String,
+    val ruleSignatureAddText: String,
+    val ruleSignatureAddContentDesc: String,
+    val ruleSignatureClear: String,
+    val ruleRoutineSection: String,
+    val ruleRoutineEmpty: String,
+    val ruleAddAction: String,
+    val ruleActionClick: String,
+    val ruleActionTypeText: String,
+    val ruleActionScroll: String,
+    val ruleActionWait: String,
+    val ruleActionBack: String,
+    val ruleActionCapture: String,
+    val ruleSelectNodeFirst: String,
+    val ruleSelectorBy: String,
+    val ruleSelectorValue: String,
+    val ruleSelectorByResourceId: String,
+    val ruleSelectorByContentDesc: String,
+    val ruleSelectorByText: String,
+    val ruleSelectorMatchContains: String,
+    val ruleScrollDirection: String,
+    val ruleScrollDirUp: String,
+    val ruleScrollDirDown: String,
+    val ruleScrollDirLeft: String,
+    val ruleScrollDirRight: String,
+    val ruleScrollAmount: String,
+    val ruleScrollAmountItems: String,
+    val ruleScrollAmountPercent: String,
+    val ruleScrollAmountPixels: String,
+    val ruleScrollAmountToEnd: String,
+    val ruleScrollValue: String,
+    val ruleTypeTextValue: String,
+    val ruleWaitMs: String,
+    val ruleRemoveAction: String,
+    val ruleSaveDisabledHint: String,
 )

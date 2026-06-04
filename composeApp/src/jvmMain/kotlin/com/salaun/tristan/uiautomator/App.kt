@@ -18,6 +18,9 @@ import com.salaun.tristan.uiautomator.ui.ExplorerScreen
 import com.salaun.tristan.uiautomator.ui.GraphScreen
 import com.salaun.tristan.uiautomator.ui.MainScreen
 import com.salaun.tristan.uiautomator.ui.ManualExplorerScreen
+import com.salaun.tristan.uiautomator.ui.RuleEditScreen
+import com.salaun.tristan.uiautomator.ui.RulePackageScreen
+import com.salaun.tristan.uiautomator.ui.RulesScreen
 import com.salaun.tristan.uiautomator.ui.SessionsScreen
 import com.salaun.tristan.uiautomator.ui.SettingsScreen
 
@@ -41,6 +44,9 @@ fun App() {
                         Screen.ManualExplorer -> ManualExplorerScreen(state)
                         Screen.Graph -> GraphScreen(state)
                         Screen.Sessions -> SessionsScreen(state)
+                        Screen.Rules -> RulesScreen(state)
+                        Screen.RulePackage -> RulePackageScreen(state)
+                        Screen.RuleEdit -> RuleEditScreen(state)
                     }
                 }
             }
