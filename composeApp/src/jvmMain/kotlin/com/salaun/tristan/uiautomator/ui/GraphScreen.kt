@@ -711,16 +711,18 @@ private fun GraphCanvas(
             val viewportWpx = with(LocalDensity.current) { maxWidth.toPx() }
             val viewportHpx = with(LocalDensity.current) { maxHeight.toPx() }
 
-            // When the session changes, snap the view back to a predictable
-            // starting point: 100% zoom, scroll at (0, 0). The cards of a
-            // fresh session are auto-laid from (MARGIN, MARGIN) onwards, so
-            // the root is visible in the top-left at readable size. Users
-            // can use "Ajuster" for a zoomed-out overview — auto-fitting by
-            // default would shrink cards below readability on big graphs.
+            // When the session changes, open on a whole-graph overview: run the
+            // same "Fit" zoom automatically and scroll to (0, 0) so the entire
+            // layout is visible at once. The user can zoom back to 100% / use
+            // the +/- buttons from there.
             var viewSetupDone by remember(session.id) { mutableStateOf(false) }
             LaunchedEffect(session.id, overridesLoaded) {
                 if (viewSetupDone || !overridesLoaded) return@LaunchedEffect
-                scale = 1f
+                scale = if (layout.totalW > 0 && layout.totalH > 0 && viewportWpx > 0f && viewportHpx > 0f) {
+                    min(viewportWpx / layout.totalW, viewportHpx / layout.totalH).coerceIn(MIN_SCALE, MAX_SCALE)
+                } else {
+                    1f
+                }
                 hScroll.scrollTo(0)
                 vScroll.scrollTo(0)
                 viewSetupDone = true

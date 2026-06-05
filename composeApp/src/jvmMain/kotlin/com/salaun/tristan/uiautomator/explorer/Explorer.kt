@@ -456,7 +456,10 @@ class Explorer(
         var stepFrom = session.states.firstOrNull { it.id == current.id } ?: current
 
         suspend fun registerStep(stepSnap: Snapshot): StateEntry? {
-            if (config.targetPackage.isNotBlank() && stepSnap.pkg != config.targetPackage) return null
+            // No package filter here: a Capture step deliberately surfaces
+            // whatever is on screen — including a system dialog from another
+            // package (e.g. com.android.permissioncontroller's Bluetooth /
+            // location permission prompt), which the routine then dismisses.
             val known = resolveKnownStateId(stepSnap)
             val st = if (known != null) {
                 session.states.firstOrNull { it.id == known }

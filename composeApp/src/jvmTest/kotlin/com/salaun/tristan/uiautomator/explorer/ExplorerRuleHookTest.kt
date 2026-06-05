@@ -228,6 +228,56 @@ class ExplorerRuleHookTest {
     }
 
     @Test
+    fun `a Capture step records a system permission dialog from another package`() {
+        // The Bluetooth rule pattern: click the permission button (→ a system
+        // dialog owned by com.android.permissioncontroller), Capture it as a
+        // step, then click Allow. The foreign-package dialog must still be
+        // registered as a state — that is the whole point of the Capture step.
+        val screen1 = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="android:id/content" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.view.View" resource-id="bt_screen" package="$pkg" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+      <node class="android.widget.Button" resource-id="$pkg:id/perms" text="Enable" package="$pkg" clickable="true" enabled="true" bounds="[40,1000][1040,1100]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        val permDialog = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" package="com.android.permissioncontroller" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.widget.Button" resource-id="com.android.permissioncontroller:id/permission_allow_button" text="Allow" package="com.android.permissioncontroller" clickable="true" enabled="true" bounds="[40,1500][1040,1600]"/>
+  </node>
+</hierarchy>"""
+        val fake = FakeAdbGateway(
+            screens = mapOf(
+                "bt" to FakeAdbGateway.Screen(screen1),
+                "dialog" to FakeAdbGateway.Screen(permDialog),
+                "done" to FakeAdbGateway.Screen(leaf("done")),
+            ),
+            tapTable = mapOf(
+                FakeAdbGateway.TapKey("bt", 540, 1050) to "dialog",
+                FakeAdbGateway.TapKey("dialog", 540, 1550) to "done",
+            ),
+            launchTarget = "bt",
+        )
+        val rule = ScreenRule(
+            id = "r", name = "Bluetooth",
+            signature = ScreenSignature(requiredResourceIds = listOf("bt_screen")),
+            routine = listOf(
+                RuleAction.Click(ElementSelector(SelectorBy.RESOURCE_ID, "perms")),
+                RuleAction.Capture,
+                RuleAction.Click(ElementSelector(SelectorBy.RESOURCE_ID, "permission_allow_button")),
+            ),
+        )
+
+        val session = runExplorer(fake, engineWith(listOf(rule)))
+
+        val dialog = session.states.singleOrNull { it.packageName == "com.android.permissioncontroller" }
+        assertNotNull(dialog, "the captured permission dialog must be registered as a state")
+        assertTrue(session.transitions.any { it.from == "S0" && it.to == dialog.id && it.action.className == "RULE" }, "bt → dialog step recorded")
+        assertTrue(session.transitions.any { it.from == dialog.id && it.action.className == "RULE" && it.to != null }, "dialog → done step recorded")
+    }
+
+    @Test
     fun `with no engine the explorer behaves exactly as before`() {
         val fake = FakeAdbGateway(
             screens = mapOf("home" to FakeAdbGateway.Screen(leaf("home"))),
