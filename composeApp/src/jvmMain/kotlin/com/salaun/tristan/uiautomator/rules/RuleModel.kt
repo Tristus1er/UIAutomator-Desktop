@@ -182,10 +182,58 @@ data class ScreenRule(
     val updatedAt: Long = 0L,
 )
 
+/**
+ * What the explorer does with an element matched by an [ElementRule].
+ * Unlike a [ScreenRule] routine (strict pass-through that replaces generic
+ * exploration of the screen), an element rule only adds or removes ONE work
+ * item — the rest of the screen keeps being explored normally.
+ */
+@Serializable
+enum class ElementBehavior {
+    /**
+     * Tap it like a regular clickable — even when the accessibility tree marks
+     * it `clickable="false"` (Compose surfaces often swallow the flag while
+     * still handling taps). This is how an otherwise-invisible interactive
+     * image becomes part of the crawl.
+     */
+    CLICK,
+
+    /** Long-press it (context menus, drag affordances). */
+    LONG_PRESS,
+
+    /** Page-swipe leftward on it (carousels, horizontal pagers). */
+    SWIPE,
+
+    /** Never touch it. A `skipped` transition is recorded so the graph shows it was seen. */
+    AVOID,
+}
+
+/**
+ * A per-element directive: when [selector] matches an element on any screen of
+ * the package, apply [behavior] to it — while the generic exploration of every
+ * other element continues unchanged. Complements [ScreenRule] (whole-screen
+ * routines with pass-through) for the "just click / just avoid this one id"
+ * cases.
+ */
+@Serializable
+data class ElementRule(
+    val id: String,
+    val name: String = "",
+    val enabled: Boolean = true,
+    val selector: ElementSelector,
+    val behavior: ElementBehavior = ElementBehavior.CLICK,
+    val createdAt: Long = 0L,
+    val updatedAt: Long = 0L,
+) {
+    val summary: String get() = "${behavior.name} · ${selector.label}"
+}
+
 /** All rules for one package. Persisted as a single JSON file per package. */
 @Serializable
 data class PackageRuleSet(
     val version: Int = 1,
     val packageName: String,
     val rules: MutableList<ScreenRule> = mutableListOf(),
+    /** Per-element directives, applied on top of (not instead of) generic exploration. */
+    val elementRules: MutableList<ElementRule> = mutableListOf(),
 )

@@ -226,6 +226,96 @@ class AdbService(@Volatile var adbPath: String) : AdbGateway {
                 .find(r.stdoutText)?.groupValues?.getOrNull(1)
     }
 
+    override suspend fun currentFocusedActivity(serial: String?): String? = withContext(Dispatchers.IO) {
+        val r = runCatching {
+            run(listOf("shell", "dumpsys", "activity", "activities"), timeoutMs = 5_000, serial = serial)
+        }.getOrNull() ?: return@withContext null
+        if (r.exitCode != 0) return@withContext null
+        val component = Regex("""mResumedActivity.*?\{[^}]*?([\w.]+/[\w.\$]+)""")
+            .find(r.stdoutText)?.groupValues?.getOrNull(1)
+            ?: Regex("""topResumedActivity.*?\{[^}]*?([\w.]+/[\w.\$]+)""")
+                .find(r.stdoutText)?.groupValues?.getOrNull(1)
+            ?: return@withContext null
+        expandComponent(component)
+    }
+
+    override suspend fun listExportedActivities(serial: String?, pkg: String): List<String> =
+        withContext(Dispatchers.IO) {
+            val r = runCatching {
+                run(listOf("shell", "dumpsys", "package", pkg), timeoutMs = 10_000, serial = serial)
+            }.getOrNull() ?: return@withContext emptyList()
+            if (r.exitCode != 0) return@withContext emptyList()
+            // The Activity Resolver Table lists every exported activity with an
+            // intent filter as `<hash> pkg/cls filter …` lines. Components may
+            // use the `pkg/.Relative` shorthand — expand to the full class name.
+            val text = r.stdoutText
+            val tableStart = text.indexOf("Activity Resolver Table")
+            if (tableStart < 0) return@withContext emptyList()
+            // The table ends at the next top-level resolver section (Receiver /
+            // Service / Provider Resolver Table) or at the end of the dump.
+            val tail = text.substring(tableStart)
+            val end = listOf("Receiver Resolver Table", "Service Resolver Table", "Provider Resolver Table")
+                .map { tail.indexOf(it) }.filter { it > 0 }.minOrNull() ?: tail.length
+            Regex("""${Regex.escape(pkg)}/[\w.\$]+""")
+                .findAll(tail.substring(0, end))
+                .map { expandComponent(it.value) }
+                .distinct()
+                .toList()
+        }
+
+    /** Expands the `pkg/.Cls` shorthand into the canonical `pkg/pkg.Cls` form. */
+    private fun expandComponent(component: String): String {
+        val pkg = component.substringBefore('/')
+        val cls = component.substringAfter('/')
+        return if (cls.startsWith(".")) "$pkg/$pkg$cls" else component
+    }
+
+    override suspend fun startActivity(serial: String?, component: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val r = runCatching {
+                run(listOf("shell", "am", "start", "-n", component), timeoutMs = 10_000, serial = serial)
+            }.getOrNull() ?: return@withContext false
+            val text = r.stdoutText + "\n" + r.stderr
+            r.exitCode == 0 && !text.contains("Error") && !text.contains("Exception")
+        }
+
+    override suspend fun hideIme(serial: String?) {
+        withContext(Dispatchers.IO) {
+            val r = runCatching {
+                run(listOf("shell", "dumpsys", "input_method"), timeoutMs = 5_000, serial = serial)
+            }.getOrNull() ?: return@withContext
+            if (!r.stdoutText.contains("mInputShown=true")) return@withContext
+            // KEYCODE_ESCAPE dismisses the IME without acting as an in-app BACK
+            // on devices that support it; older keyboards fall back to BACK
+            // semantics anyway, which also just closes the IME when shown.
+            runCatching {
+                run(listOf("shell", "input", "keyevent", "111"), timeoutMs = 5_000, serial = serial)
+            }
+        }
+    }
+
+    override suspend fun clearCrashLog(serial: String?) {
+        withContext(Dispatchers.IO) {
+            runCatching { run(listOf("logcat", "-b", "crash", "-c"), timeoutMs = 5_000, serial = serial) }
+        }
+    }
+
+    override suspend fun recentCrashLog(serial: String?, pkg: String): String? =
+        withContext(Dispatchers.IO) {
+            val r = runCatching {
+                run(listOf("logcat", "-b", "crash", "-d"), timeoutMs = 5_000, serial = serial)
+            }.getOrNull() ?: return@withContext null
+            if (r.exitCode != 0) return@withContext null
+            val lines = r.stdoutText.lines()
+            val fatalIdx = lines.indexOfLast { it.contains("FATAL EXCEPTION") }
+            if (fatalIdx < 0) return@withContext null
+            // Attribute the crash to the target package: the "Process: <pkg>"
+            // line directly follows the FATAL EXCEPTION header.
+            val window = lines.drop(fatalIdx).take(8)
+            if (window.none { it.contains("Process: $pkg") }) return@withContext null
+            window.joinToString("\n").take(500)
+        }
+
     override suspend fun dumpUiXml(serial: String?): String = withContext(Dispatchers.IO) {
         retryWithBackoff(
             backoffsMs = UI_DUMP_BACKOFFS_MS,

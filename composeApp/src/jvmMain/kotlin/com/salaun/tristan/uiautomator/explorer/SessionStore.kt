@@ -47,6 +47,13 @@ class SessionStore(val baseDir: File) {
         return "states/${f.name}"
     }
 
+    /** Writes a state's stitched full-scroll capture next to its plain screenshot. */
+    fun writeScrollScreenshot(stateId: String, bytes: ByteArray): String {
+        val f = File(statesDir, "${stateId}_scroll.png")
+        f.writeBytes(bytes)
+        return "states/${f.name}"
+    }
+
     fun writeXml(stateId: String, xml: String): String {
         val f = File(statesDir, "$stateId.xml")
         f.writeText(xml, Charsets.UTF_8)

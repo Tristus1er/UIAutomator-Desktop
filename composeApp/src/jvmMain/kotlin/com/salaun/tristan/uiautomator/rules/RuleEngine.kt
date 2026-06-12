@@ -25,6 +25,25 @@ class RuleEngine(private val ruleStore: RuleStore) {
     fun rulesFor(pkg: String): List<ScreenRule> =
         ruleStore.load(pkg).rules.filter { it.enabled && !it.signature.isEmpty }
 
+    /** Enabled element rules for [pkg] (per-element click / avoid directives). */
+    fun elementRulesFor(pkg: String): List<ElementRule> =
+        ruleStore.load(pkg).elementRules.filter { it.enabled && it.selector.value.isNotBlank() }
+
+    /**
+     * Every node of [root] matched by [selector] (visible bounds required).
+     * Unlike [resolve] this returns ALL hits: an element rule like "click every
+     * vcard image" must produce one work item per matching element.
+     */
+    fun resolveAllNodes(root: UiNode, selector: ElementSelector): List<UiNode> {
+        val out = ArrayList<UiNode>()
+        root.walk { n ->
+            val b = n.bounds
+            if (b == null || b.width <= 0 || b.height <= 0) return@walk
+            if (selectorHits(selector, n.resourceId, n.text, n.contentDesc)) out += n
+        }
+        return out
+    }
+
     /** First rule in [rules] whose signature matches [root], or null. */
     fun matchRule(root: UiNode, pkg: String, rules: List<ScreenRule>): ScreenRule? =
         rules.firstOrNull { matches(it.signature, root, pkg) }
@@ -157,12 +176,7 @@ class RuleEngine(private val ruleStore: RuleStore) {
             if (best != null) return@walk
             val b = n.bounds
             if (b == null || b.width <= 0 || b.height <= 0) return@walk
-            val hit = when (selector.by) {
-                SelectorBy.RESOURCE_ID -> n.resourceId.isNotBlank() && idHit(n.resourceId, selector.value)
-                SelectorBy.CONTENT_DESC -> n.contentDesc.isNotBlank() && textHit(n.contentDesc, selector.value, selector.match)
-                SelectorBy.TEXT -> n.text.isNotBlank() && textHit(n.text, selector.value, selector.match)
-            }
-            if (hit) best = n
+            if (selectorHits(selector, n.resourceId, n.text, n.contentDesc)) best = n
         }
         return best
     }
@@ -187,6 +201,18 @@ class RuleEngine(private val ruleStore: RuleStore) {
 
         /** Default items-per-screen heuristic when no itemHeightPx is given. */
         private const val DEFAULT_VISIBLE_ITEMS = 10
+
+        /**
+         * Shared "does [selector] address this element?" predicate, usable both
+         * on live [UiNode]s and on recorded `ClickableRef`s (which carry the
+         * same id / text / content-desc triple).
+         */
+        fun selectorHits(selector: ElementSelector, resourceId: String, text: String, contentDesc: String): Boolean =
+            when (selector.by) {
+                SelectorBy.RESOURCE_ID -> resourceId.isNotBlank() && idHit(resourceId, selector.value)
+                SelectorBy.CONTENT_DESC -> contentDesc.isNotBlank() && textHit(contentDesc, selector.value, selector.match)
+                SelectorBy.TEXT -> text.isNotBlank() && textHit(text, selector.value, selector.match)
+            }
 
         // Both sides are trimmed so a stray newline / space picked up when a
         // value was pasted into the editor (e.g. "\ntag_…_button_agree") still

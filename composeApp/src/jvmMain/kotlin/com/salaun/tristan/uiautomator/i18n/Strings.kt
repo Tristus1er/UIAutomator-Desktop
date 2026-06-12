@@ -188,6 +188,7 @@ data class Strings(
     // -- Screenshot detail window --------------------------------------------
     val detailClickablesCountFmt: String, // "%d clickable elements"
     val detailShowClickables: String,
+    val detailShowFullScroll: String,
     val detailPackageUnknown: String,
     val detailDestination: String,
     val detailDestinationHint: String,
@@ -224,6 +225,20 @@ data class Strings(
     val ruleMoveDown: String,
     val ruleDeleteConfirmTitle: String,
     val ruleDeleteConfirmBodyFmt: String, // "%s"
+
+    // -- Rules: element rules (per-element directives) -------------------------
+    val elementRulesTitle: String,
+    val elementRulesHint: String,
+    val elementRuleAdd: String,
+    val elementRulesEmpty: String,
+    val elementRuleBehaviorLabel: String,
+    val elementRuleBehaviorClick: String,
+    val elementRuleBehaviorLongPress: String,
+    val elementRuleBehaviorSwipe: String,
+    val elementRuleBehaviorAvoid: String,
+    val elementRuleEditTitleNew: String,
+    val elementRuleEditTitleEdit: String,
+    val elementRuleDeleteConfirmTitle: String,
 
     // -- Rules: editor screen -------------------------------------------------
     val ruleEditTitleNew: String,

@@ -8,12 +8,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -39,13 +39,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.salaun.tristan.uiautomator.AppState
 import com.salaun.tristan.uiautomator.Screen
 import com.salaun.tristan.uiautomator.explorer.SessionStore
@@ -190,78 +194,161 @@ private fun SessionRow(
     onExport: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Column(
+    // A single fixed-height row: the texts and action buttons live in the left
+    // column, so the thumbnails can span the FULL height of the card.
+    Row(
         modifier = Modifier
             .fillMaxWidth()
+            .height(THUMB_ROW_HEIGHT)
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Column(modifier = Modifier.weight(1f)) {
+        Column(
+            modifier = Modifier.weight(1f).fillMaxHeight(),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column {
                 Text(
                     summary.session.targetPackage.ifBlank { strings.sessionsUnknownPackage },
                     style = MaterialTheme.typography.titleSmall,
                 )
                 Text(summary.dir.name, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            SessionThumbnails(summary, modifier = Modifier.weight(1f))
-            Column(horizontalAlignment = Alignment.End) {
-                Text(formatTimestamp(summary.session.startedAt), style = MaterialTheme.typography.bodySmall)
-                Text(
-                    strings.sessionsStatesTransitionsFmt.format(
-                        summary.session.states.size,
-                        summary.session.transitions.size,
-                    ),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onOpen) { Text(strings.open) }
+                OutlinedButton(onClick = onExport) { Text(strings.exportLabel) }
+                OutlinedButton(onClick = onDelete) {
+                    Text(strings.delete, color = MaterialTheme.colorScheme.error)
+                }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onOpen) { Text(strings.open) }
-            OutlinedButton(onClick = onExport) { Text(strings.exportLabel) }
-            OutlinedButton(onClick = onDelete) {
-                Text(strings.delete, color = MaterialTheme.colorScheme.error)
+        SessionThumbnails(summary, modifier = Modifier.weight(1f))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(formatTimestamp(summary.session.startedAt), style = MaterialTheme.typography.bodySmall)
+            Text(
+                strings.sessionsStatesTransitionsFmt.format(
+                    summary.session.states.size,
+                    summary.session.transitions.size,
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** Height of a session card — the thumbnails stretch to fill all of it. */
+private val THUMB_ROW_HEIGHT = 180.dp
+
+/**
+ * Pixel height thumbnails are decoded at. ~2× the displayed dp height, so the
+ * image stays crisp on HiDPI screens while a full 1080×2400 capture (~10 MB of
+ * ARGB once decoded) shrinks to a few hundred KB in memory.
+ */
+private const val THUMB_DECODE_HEIGHT_PX = 384
+
+/** Portrait-phone aspect ratio used for the placeholder while a thumb decodes. */
+private const val THUMB_PLACEHOLDER_RATIO = 0.46f
+
+/**
+ * Shows the first 1-3 captured screens of a session as thumbnails between the
+ * session's metadata columns. Each thumbnail fills the row height (keeping its
+ * aspect ratio) and is decoded lazily: off the UI thread, downscaled to
+ * display size, and only while its row is composed — scrolled-away rows are
+ * disposed by the LazyColumn, releasing their bitmaps. The count adapts to the
+ * width actually available (via [BoxWithConstraints]) so narrow windows simply
+ * show fewer.
+ */
+@Composable
+private fun SessionThumbnails(summary: SessionSummary, modifier: Modifier = Modifier) {
+    val store = remember(summary.dir.absolutePath) { SessionStore(summary.dir) }
+    BoxWithConstraints(modifier = modifier.fillMaxHeight(), contentAlignment = Alignment.Center) {
+        // A portrait thumb at full card height is ~ratio*height wide (+ gap);
+        // adapt the count to the width actually available, never more than 3.
+        val cellWidth = THUMB_ROW_HEIGHT * THUMB_PLACEHOLDER_RATIO + 6.dp
+        val maxCount = (maxWidth / cellWidth).toInt().coerceIn(0, 3)
+        if (maxCount == 0) return@BoxWithConstraints
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxHeight()) {
+            summary.session.states.take(maxCount).forEach { st ->
+                LazyThumbnail(
+                    store = store,
+                    dirKey = summary.dir.absolutePath,
+                    path = st.screenshotPath,
+                    contentDescription = st.id,
+                )
             }
         }
     }
 }
 
 /**
- * Shows the first 1-3 captured screens of a session as small thumbnails between
- * the session's metadata columns. The count adapts to the width actually
- * available (via [BoxWithConstraints]) so narrow windows simply show fewer.
+ * One asynchronously-decoded thumbnail: a neutral placeholder is shown while
+ * the PNG is read and downscaled on [Dispatchers.IO], then the image fades in
+ * at full row height with its real aspect ratio.
  */
 @Composable
-private fun SessionThumbnails(summary: SessionSummary, modifier: Modifier = Modifier) {
-    val store = remember(summary.dir.absolutePath) { SessionStore(summary.dir) }
-    BoxWithConstraints(modifier = modifier, contentAlignment = Alignment.Center) {
-        // ~64dp per thumbnail cell (thumb + gap); never more than 3.
-        val maxCount = (maxWidth / 64.dp).toInt().coerceIn(0, 3)
-        if (maxCount == 0) return@BoxWithConstraints
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            summary.session.states.take(maxCount).forEach { st ->
-                val bmp = remember(summary.dir.absolutePath, st.screenshotPath) {
-                    loadThumbnail(store, st.screenshotPath)
-                }
-                if (bmp != null) {
-                    Image(
-                        bitmap = bmp,
-                        contentDescription = st.id,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .height(76.dp)
-                            .widthIn(max = 56.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(MaterialTheme.colorScheme.surface),
-                    )
-                }
-            }
-        }
+private fun LazyThumbnail(
+    store: SessionStore,
+    dirKey: String,
+    path: String,
+    contentDescription: String,
+) {
+    var bmp by remember(dirKey, path) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(dirKey, path) {
+        bmp = withContext(Dispatchers.IO) { loadScaledThumbnail(store, path, THUMB_DECODE_HEIGHT_PX) }
+    }
+    val image = bmp
+    if (image != null) {
+        Image(
+            bitmap = image,
+            contentDescription = contentDescription,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier
+                .fillMaxHeight()
+                .aspectRatio(image.width.toFloat() / image.height.toFloat())
+                .clip(RoundedCornerShape(4.dp))
+                .background(MaterialTheme.colorScheme.surface),
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .fillMaxHeight()
+                .aspectRatio(THUMB_PLACEHOLDER_RATIO)
+                .clip(RoundedCornerShape(4.dp))
+                .background(MaterialTheme.colorScheme.surface),
+        )
     }
 }
+
+/**
+ * Decodes the screenshot at [path] and downscales it to [targetHeightPx]
+ * (bilinear). Returns the full-size bitmap only when it is already smaller.
+ * Keeping the decode here — instead of reusing the full-size
+ * [loadThumbnail] — is what bounds the session list's memory to a few
+ * hundred KB per visible row instead of ~30 MB.
+ */
+private fun loadScaledThumbnail(store: SessionStore, path: String, targetHeightPx: Int): ImageBitmap? =
+    runCatching {
+        val bytes = store.readScreenshot(path) ?: return null
+        val full = javax.imageio.ImageIO.read(bytes.inputStream()) ?: return null
+        if (full.height <= targetHeightPx) return full.toComposeImageBitmap()
+        val w = (full.width.toLong() * targetHeightPx / full.height).toInt().coerceAtLeast(1)
+        val scaled = java.awt.image.BufferedImage(w, targetHeightPx, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val g = scaled.createGraphics()
+        try {
+            g.setRenderingHint(
+                java.awt.RenderingHints.KEY_INTERPOLATION,
+                java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR,
+            )
+            g.drawImage(full, 0, 0, w, targetHeightPx, null)
+        } finally {
+            g.dispose()
+        }
+        scaled.toComposeImageBitmap()
+    }.getOrNull()
 
 private fun formatTimestamp(epochMs: Long): String =
     SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT).format(Date(epochMs))

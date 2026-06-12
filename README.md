@@ -1,5 +1,10 @@
 This is a Kotlin Multiplatform project targeting Desktop (JVM).
 
+📖 **User documentation: [docs/TUTORIEL.md](./docs/TUTORIEL.md)** (English) ·
+**[docs/TUTORIEL_FR.md](./docs/TUTORIEL_FR.md)** (français) — every feature
+(capture, manual and automatic exploration, rules, graph, sessions, settings).
+Screenshots live in `docs/images/`.
+
 * [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
   It contains several subfolders:
     - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.

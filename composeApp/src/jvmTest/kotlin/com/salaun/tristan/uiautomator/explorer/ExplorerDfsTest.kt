@@ -95,6 +95,9 @@ class ExplorerDfsTest {
             ),
             tapTable = mapOf(
                 FakeAdbGateway.TapKey("home", 50, 50) to "home",
+                // The no-effect tap retry probes an off-centre point of the
+                // element (left quarter) before recording the self-loop.
+                FakeAdbGateway.TapKey("home", 45, 50) to "home",
             ),
             launchTarget = "home",
         )
@@ -1084,6 +1087,7 @@ class ExplorerDfsTest {
             ),
             tapTable = mapOf(
                 FakeAdbGateway.TapKey("login", 540, 260) to "login", // tapping the field stays put
+                FakeAdbGateway.TapKey("login", 290, 260) to "login", // off-centre no-effect retry
                 FakeAdbGateway.TapKey("login", 540, 460) to "home2", // login navigates once filled
             ),
             launchTarget = "login",

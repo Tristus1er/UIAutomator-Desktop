@@ -855,6 +855,36 @@ class AppState(
         ruleRevision++
     }
 
+    // --- Element rules (per-element directives, additive to generic exploration) ---
+
+    fun elementRulesFor(pkg: String): List<com.salaun.tristan.uiautomator.rules.ElementRule> =
+        ruleStore.load(pkg).elementRules.toList()
+
+    /** Upserts [rule] into [pkg]'s element-rule list (matched by id) and persists. */
+    fun saveElementRule(pkg: String, rule: com.salaun.tristan.uiautomator.rules.ElementRule) {
+        val set = ruleStore.load(pkg)
+        val idx = set.elementRules.indexOfFirst { it.id == rule.id }
+        if (idx >= 0) set.elementRules[idx] = rule else set.elementRules.add(rule)
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    fun deleteElementRule(pkg: String, ruleId: String) {
+        val set = ruleStore.load(pkg)
+        set.elementRules.removeAll { it.id == ruleId }
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
+    fun setElementRuleEnabled(pkg: String, ruleId: String, enabled: Boolean) {
+        val set = ruleStore.load(pkg)
+        val idx = set.elementRules.indexOfFirst { it.id == ruleId }
+        if (idx < 0) return
+        set.elementRules[idx] = set.elementRules[idx].copy(enabled = enabled, updatedAt = System.currentTimeMillis())
+        ruleStore.save(set)
+        ruleRevision++
+    }
+
     fun exportRulePackage(pkg: String, outFile: java.io.File) {
         scope.launch {
             try {

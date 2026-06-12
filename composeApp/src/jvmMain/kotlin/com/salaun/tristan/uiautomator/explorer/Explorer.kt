@@ -3,6 +3,7 @@ package com.salaun.tristan.uiautomator.explorer
 import com.salaun.tristan.uiautomator.adb.AdbGateway
 import com.salaun.tristan.uiautomator.model.DumpParser
 import com.salaun.tristan.uiautomator.model.UiNode
+import com.salaun.tristan.uiautomator.rules.ElementBehavior
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -56,6 +57,26 @@ data class ExplorerProgress(
  * handled by relaunching the app and replaying the path that originally
  * led to the desired source state. A trailing fix-up pass re-attempts every
  * state still holding unexercised clickables once more before quitting.
+ *
+ * Further classic exception paths handled generically:
+ *  - **ANR / crash dialogs** are detected by caption: an ANR is waited out
+ *    (the app often recovers), a crash is dismissed and recorded as a
+ *    `crashed` transition annotated with the logcat FATAL EXCEPTION header.
+ *    A silent crash to the launcher is attributed the same way.
+ *  - **Destructive elements** (logout / delete / buy / call…) follow the
+ *    configurable [DestructivePolicy] — skipped by default so one mis-tap on
+ *    "Sign out" can't strand the entire post-login app.
+ *  - **System gate dialogs** beyond permissions (GMS "turn on Bluetooth /
+ *    Location") are auto-accepted through the same grant chain.
+ *  - **Horizontal pagers** get synthetic page-swipe actions (the only way to
+ *    advance swipe-only onboardings) and **long-clickable** nodes get a
+ *    long-press action (context menus invisible to taps).
+ *  - The foreground **Activity** is recorded per state and vetoes dedup
+ *    merges across Activities; digit-masked fingerprints merge counter /
+ *    clock variants of one screen. At the end of the crawl the explorer
+ *    reports manifest **activity coverage** and direct-launches (`am start`)
+ *    every exported activity the UI walk never reached.
+ *  - An interrupted session can be continued with [resume].
  */
 class Explorer(
     private val adb: AdbGateway,
@@ -83,6 +104,8 @@ class Explorer(
         val root: UiNode,
         val pkg: String,
         val fingerprint: String,
+        /** Foreground Activity component (`pkg/cls`), when the device exposes it. */
+        val activity: String? = null,
     )
 
     private lateinit var session: ExplorationSession
@@ -111,6 +134,40 @@ class Explorer(
      * rather than two variants of the same screen.
      */
     private val resourceIdsByStateId = HashMap<String, Set<String>>()
+    /**
+     * Maps a *normalized* fingerprint (digit runs masked — see
+     * [StateOps.normalizedFingerprint]) to the first state that carried it.
+     * Secondary dedup tier: the same screen with a counter / timestamp /
+     * percentage changed resolves back to its state instead of minting a
+     * near-duplicate. Honoured only when the foreground activities agree.
+     */
+    private val normalizedFpToId = HashMap<String, String>()
+    /** Foreground Activity recorded per state — vetoes cross-activity dedup merges. */
+    private val activityByStateId = HashMap<String, String>()
+    /** Every Activity component a registered state was hosted by (coverage report). */
+    private val visitedActivities = HashSet<String>()
+    /** Transitions indexed by source state — [isExercised] runs per clickable, per loop turn. */
+    private val transitionsByFrom = HashMap<String, MutableList<TransitionEntry>>()
+    /** Productive forward adjacency (non-loop, in-app, no-error), maintained incrementally. */
+    private val forwardAdj = HashMap<String, MutableSet<String>>()
+    /** Navigation-usable forward steps, maintained incrementally by [addTransition]. */
+    private val navForward = ArrayList<NavStep.Forward>()
+    /**
+     * Keys of recorded forward edges that repeatedly failed to reproduce
+     * (their tap now lands elsewhere — a state-dependent button, a server
+     * change). Pruned from the navigation graph after
+     * [EDGE_FAILURES_BEFORE_PRUNE] failures so planning stops trusting them.
+     */
+    private val deadForwardEdges = HashSet<String>()
+    private val forwardEdgeFailures = HashMap<String, Int>()
+    /**
+     * Maps a state to the root of its exploration subtree: [rootStateId] for
+     * everything reached through the UI, or the direct-launched state's own id
+     * for screens opened with `am start -n` during the manifest-coverage
+     * phase. Recovery for a subtree relaunches its anchor component and
+     * replays the path from there.
+     */
+    private val subtreeRootByStateId = HashMap<String, String>()
     private var processed = 0
     private var planned = 0
 
@@ -152,6 +209,14 @@ class Explorer(
         if (pkgRules.isNotEmpty()) {
             listener.onLog("📐 ${pkgRules.size} custom screen rule(s) loaded for ${config.targetPackage}")
         }
+        pkgElementRules = ruleEngine?.elementRulesFor(config.targetPackage).orEmpty()
+        if (pkgElementRules.isNotEmpty()) {
+            listener.onLog("🎯 ${pkgElementRules.size} element rule(s) loaded for ${config.targetPackage}")
+        }
+
+        // Start from a clean crash buffer so a FATAL EXCEPTION found later is
+        // guaranteed to belong to this exploration, not a previous run.
+        runCatching { adb.clearCrashLog(serial) }
 
         // Freeze the system status bar BEFORE the first capture so the very
         // first fingerprint already reflects a stable clock / battery / signal.
@@ -185,7 +250,7 @@ class Explorer(
             // captured as its own state and the auto-grant linked to the
             // screen behind it once the root is registered below.
             var launchGrant: GrantOutcome? = null
-            if (initial.pkg in StateOps.PERMISSION_PACKAGES) {
+            if (StateOps.isPermissionGatePackage(initial.pkg)) {
                 listener.onLog("⚠ Permission dialog on launch — auto-granting…")
                 launchGrant = grantPermissionChain(
                     first = initial, incomingFrom = null, incomingAction = null, triggerPath = emptyList(),
@@ -211,7 +276,7 @@ class Explorer(
             fingerprintToId[root.fingerprint] = root.id
             // Link the last launch-permission dialog to the now-registered root.
             launchGrant?.let { g ->
-                session.transitions += TransitionEntry(g.lastDialogId, root.id, g.lastAllowAction)
+                addTransition(TransitionEntry(g.lastDialogId, root.id, g.lastAllowAction))
             }
             planned += root.clickables.size
             listener.onLog("Initial state ${root.id} (${root.clickables.size} actions)")
@@ -226,18 +291,172 @@ class Explorer(
             // the app's own recorded edges.
             frontierExplore(root)
 
+            // Manifest coverage: report how many declared (exported) activities
+            // the crawl actually visited, and direct-launch the rest.
+            reportAndLaunchUnvisitedActivities()
+
             val spine = detectOnboardingSpine()
             if (spine.size >= 3) {
                 listener.onLog("🚀 Onboarding sequence (shown once, then never again): ${spine.joinToString(" → ")} (${spine.size} screens)")
             }
 
             session.endedAt = System.currentTimeMillis()
-            persist()
+            persist(force = true)
             listener.onLog("Exploration done: ${session.states.size} states, ${session.transitions.size} transitions.")
             return session
         } finally {
+            // Flush whatever was recorded, even on cancellation — a partially
+            // explored session on disk is what `resume()` picks back up.
+            runCatching { persist(force = true) }
             // Always restore the live status bar, even on cancellation/exception,
             // otherwise the user is stuck with a frozen clock until they reboot.
+            if (demoOn) {
+                runCatching { adb.exitDemoMode(serial) }
+                listener.onLog("✓ SystemUI demo mode disabled")
+            }
+        }
+    }
+
+    /**
+     * End-of-crawl manifest phase. Logs the activity coverage (visited vs
+     * declared exported activities) and, when
+     * [ExplorationConfig.launchUnvisitedActivities] is on, opens each
+     * unreached exported activity directly with `am start -n` and explores
+     * from there — screens only reachable through deep links or conditional
+     * flows become part of the map instead of staying invisible.
+     */
+    private suspend fun reportAndLaunchUnvisitedActivities() {
+        val declared = runCatching { adb.listExportedActivities(serial, config.targetPackage) }
+            .getOrDefault(emptyList())
+        if (declared.isEmpty()) return
+        val unvisited = declared.filter { it !in visitedActivities }
+        val covered = declared.size - unvisited.size
+        listener.onLog("📊 Activity coverage: $covered/${declared.size} exported activities visited (${covered * 100 / declared.size}%)")
+        if (unvisited.isEmpty() || !config.launchUnvisitedActivities) return
+        for (component in unvisited) {
+            if (!coroutineContext.isActive || session.states.size >= config.maxStates) return
+            listener.onLog("🚪 direct launch: $component")
+            val ok = runCatching { adb.startActivity(serial, component) }.getOrDefault(false)
+            if (!ok) {
+                listener.onLog("  ✘ am start failed — skipping")
+                continue
+            }
+            delay(config.settleDelayMs + 300)
+            val snap = runCatching { waitOutLongOperation(capture()) }.getOrNull() ?: continue
+            if (config.targetPackage.isNotBlank() && snap.pkg != config.targetPackage) {
+                listener.onLog("  ⇗ $component left the app (${snap.pkg}) — skipping")
+                runCatching { adb.pressBack(serial) }
+                continue
+            }
+            val known = resolveKnownStateId(snap)
+            if (known != null) {
+                listener.onLog("  → screen already covered by $known")
+                snap.activity?.let { visitedActivities += it }
+                continue
+            }
+            val st = registerState(snap, depth = 0, path = emptyList(), directLaunchComponent = component)
+            fingerprintToId[snap.fingerprint] = st.id
+            planned += st.clickables.size
+            listener.onLog("  → new ${st.id} (${st.clickables.size} actions)")
+            emit(st.id, null)
+            persist(force = true)
+            frontierExplore(st)
+        }
+    }
+
+    /**
+     * Resumes an interrupted exploration from its persisted [existing]
+     * session: every identity index (fingerprints, root ids, activities,
+     * navigation edges) is rebuilt from the session file and the saved XML
+     * dumps, the app is relaunched, and the frontier walk continues from the
+     * first recognised screen. A crawl killed by a cable pull or a timeout no
+     * longer starts over from zero.
+     */
+    suspend fun resume(existing: ExplorationSession, listener: Listener): ExplorationSession {
+        this.listener = listener
+        session = existing
+        session.endedAt = null
+        listener.onLog("▶ Resuming session ${session.id} (${session.states.size} states, ${session.transitions.size} transitions)")
+
+        pkgRules = ruleEngine?.rulesFor(config.targetPackage).orEmpty()
+        pkgElementRules = ruleEngine?.elementRulesFor(config.targetPackage).orEmpty()
+        runCatching { adb.clearCrashLog(serial) }
+
+        // -- Rebuild the identity indexes from the persisted states ----------
+        for (st in session.states) {
+            fingerprintToId.putIfAbsent(st.fingerprint, st.id)
+            st.activity?.let { act ->
+                activityByStateId[st.id] = act
+                visitedActivities += act
+            }
+            if (st.packageName in StateOps.PERMISSION_PACKAGES) permissionDialogStateIds += st.id
+            if (st.directLaunchComponent != null) subtreeRootByStateId[st.id] = st.id
+            // Field auto-fill and scroll/pager harvest already ran for stored
+            // states — their harvested clickables are in the session file.
+            preparedStates += st.id
+            val root = runCatching {
+                DumpParser.parse(java.io.File(store.baseDir, st.xmlPath).readText(Charsets.UTF_8))
+            }.getOrNull() ?: continue
+            structureFingerprintByStateId[st.id] = StateOps.structureFingerprint(root)
+            resourceIdsByStateId[st.id] = StateOps.screenResourceIds(root, config.targetPackage)
+            normalizedFpToId.putIfAbsent(StateOps.normalizedFingerprint(root), st.id)
+            StateOps.rootScreenId(root, config.targetPackage)?.let { rid ->
+                rootIdToStateId.putIfAbsent(rid, st.id)
+            }
+        }
+        rootStateId = session.states.firstOrNull { it.packageName == config.targetPackage }?.id
+            ?: session.states.firstOrNull()?.id
+
+        // -- Rebuild the navigation graph from the persisted transitions -----
+        for (t in session.transitions) {
+            transitionsByFrom.getOrPut(t.from) { mutableListOf() } += t
+            val to = t.to ?: continue
+            if (t.loop || t.leftApp || t.errorMessage != null || t.skipped || to == t.from) continue
+            forwardAdj.getOrPut(t.from) { HashSet() }.add(to)
+            if (t.from !in permissionDialogStateIds && to !in permissionDialogStateIds) {
+                navForward += NavStep.Forward(t.from, to, t.action)
+            }
+            backLeadsTo.putIfAbsent(to, t.from)
+        }
+        // Direct-launch subtree membership: states reachable from an anchor
+        // (and not from the main root) belong to that anchor's subtree.
+        for (anchor in session.states.mapNotNull { st -> st.id.takeIf { st.directLaunchComponent != null } }) {
+            val queue = ArrayDeque<String>().apply { add(anchor) }
+            val seen = HashSet<String>().apply { add(anchor) }
+            while (queue.isNotEmpty()) {
+                val u = queue.removeFirst()
+                for (v in forwardAdj[u].orEmpty()) {
+                    if (seen.add(v)) {
+                        subtreeRootByStateId.putIfAbsent(v, anchor)
+                        queue += v
+                    }
+                }
+            }
+        }
+        processed = session.transitions.size
+        planned = session.states.sumOf { it.clickables.size }
+
+        val demoOn = runCatching { adb.enterDemoMode(serial) }.getOrDefault(false)
+        try {
+            adb.launchApp(serial, config.targetPackage)
+            delay(config.settleDelayMs + 500)
+            val landed = waitForKnownState()
+            if (landed == null) {
+                listener.onLog("⚠ No known state reappeared after relaunch — cannot resume.")
+                session.endedAt = System.currentTimeMillis()
+                persist(force = true)
+                return session
+            }
+            listener.onLog("↳ re-attached on ${landed.id}; continuing the frontier walk")
+            emit(landed.id, null)
+            frontierExplore(landed)
+            reportAndLaunchUnvisitedActivities()
+            session.endedAt = System.currentTimeMillis()
+            persist(force = true)
+            listener.onLog("Exploration done: ${session.states.size} states, ${session.transitions.size} transitions.")
+            return session
+        } finally {
+            runCatching { persist(force = true) }
             if (demoOn) {
                 runCatching { adb.exitDemoMode(serial) }
                 listener.onLog("✓ SystemUI demo mode disabled")
@@ -275,6 +494,25 @@ class Explorer(
 
     /** Custom screen rules for the target package, loaded once at the start of [run]. */
     private var pkgRules: List<com.salaun.tristan.uiautomator.rules.ScreenRule> = emptyList()
+
+    /**
+     * Per-element directives for the target package (see
+     * [com.salaun.tristan.uiautomator.rules.ElementRule]). Unlike [pkgRules]
+     * they do NOT replace generic exploration of the screen: CLICK /
+     * LONG_PRESS / SWIPE inject one extra work item per matching element (even
+     * when the accessibility tree says `clickable="false"` — Compose surfaces
+     * often handle taps without exposing the flag), AVOID withdraws matching
+     * clickables from the frontier as `skipped` transitions.
+     */
+    private var pkgElementRules: List<com.salaun.tristan.uiautomator.rules.ElementRule> = emptyList()
+
+    /** First enabled element rule addressing [c], or `null`. */
+    private fun elementRuleFor(c: ClickableRef): com.salaun.tristan.uiautomator.rules.ElementRule? =
+        pkgElementRules.firstOrNull {
+            com.salaun.tristan.uiautomator.rules.RuleEngine.selectorHits(
+                it.selector, c.resourceId, c.text, c.contentDesc,
+            )
+        }
 
     /**
      * State ids for which a custom rule has already been considered. Used only
@@ -330,15 +568,46 @@ class Explorer(
      * detection.
      */
     private fun navForwardEdges(): List<NavStep.Forward> {
-        val out = ArrayList<NavStep.Forward>()
-        for (t in session.transitions) {
-            val to = t.to ?: continue
-            if (t.loop || t.leftApp || t.errorMessage != null || to == t.from) continue
-            if (t.from in permissionDialogStateIds || to in permissionDialogStateIds) continue
-            out += NavStep.Forward(t.from, to, t.action)
-        }
-        out += navShortcuts
+        val out = ArrayList<NavStep.Forward>(navForward.size + navShortcuts.size)
+        for (e in navForward) if (edgeKey(e) !in deadForwardEdges) out += e
+        for (e in navShortcuts) if (edgeKey(e) !in deadForwardEdges) out += e
         return out
+    }
+
+    /** Identity of a forward navigation edge, for the failure / pruning ledger. */
+    private fun edgeKey(e: NavStep.Forward): String =
+        "${e.from}|${e.to}|${e.action.resourceId}|${e.action.bounds}|${e.action.gesture}"
+
+    /**
+     * Records that following [e] did not land on its recorded destination.
+     * After [EDGE_FAILURES_BEFORE_PRUNE] failures the edge is dropped from the
+     * navigation graph — re-planning around a stale edge once is cheap, but
+     * trusting it forever turns every visit into a detour.
+     */
+    private fun recordEdgeFailure(e: NavStep.Forward) {
+        val key = edgeKey(e)
+        val n = (forwardEdgeFailures[key] ?: 0) + 1
+        forwardEdgeFailures[key] = n
+        if (n >= EDGE_FAILURES_BEFORE_PRUNE && deadForwardEdges.add(key)) {
+            listener.onLog("  ✂ stale edge ${e.from}→${e.to} pruned after $n failed replays")
+        }
+    }
+
+    /**
+     * Single point through which every transition is recorded. Keeps the
+     * per-source index, the forward adjacency and the navigation edge list in
+     * sync — these are consulted once per clickable per frontier turn, so the
+     * old full-list scans were quadratic in session size.
+     */
+    private fun addTransition(t: TransitionEntry) {
+        session.transitions += t
+        transitionsByFrom.getOrPut(t.from) { mutableListOf() } += t
+        val to = t.to ?: return
+        if (t.loop || t.leftApp || t.errorMessage != null || t.skipped || to == t.from) return
+        forwardAdj.getOrPut(t.from) { HashSet() }.add(to)
+        if (t.from !in permissionDialogStateIds && to !in permissionDialogStateIds) {
+            navForward += NavStep.Forward(t.from, to, t.action)
+        }
     }
 
     /** BACK edges usable for navigation (excluding any touching a one-time dialog). */
@@ -382,12 +651,33 @@ class Explorer(
             if (current.id !in exhaustedStates && branchDepth(current.id) < config.maxDepth) {
                 prepareStateForExploration(current)
                 current = session.states.firstOrNull { it.id == current.id } ?: current
-                // Exercise the screen's real content before its back/close
-                // affordance, so we don't leave a screen the instant we tap the
-                // top-left back arrow and abandon its primary buttons.
+                // Elements an AVOID rule targets — and destructive elements
+                // under the SKIP policy — are flagged as deliberately-skipped
+                // transitions (so the graph shows they were seen) and never
+                // tapped. A CLICK/LONG_PRESS/SWIPE element rule exempts its
+                // target from the destructive guard: the user asked for it.
+                for (c in current.clickables) {
+                    if (isExercised(current, c)) continue
+                    val rule = elementRuleFor(c)
+                    val avoided = rule?.behavior == ElementBehavior.AVOID
+                    val destructiveSkip = rule == null &&
+                        config.destructivePolicy == DestructivePolicy.SKIP &&
+                        StateOps.isLikelyDestructive(c)
+                    if (!avoided && !destructiveSkip) continue
+                    val why = if (avoided) "AVOID rule « ${rule!!.name.ifBlank { rule.selector.label }} »" else "policy SKIP"
+                    listener.onLog("  ⛔ ${current.id} · « ${c.label} » skipped ($why)")
+                    addTransition(TransitionEntry(current.id, null, c, skipped = true))
+                    countProcessed(current.id, c.label)
+                }
+                // Exercise unlocking affordances (consent / agree banners)
+                // first, the screen's real content next, its back/close
+                // affordance after that, and destructive elements last (when
+                // the policy taps them at all) — so we neither leave a screen
+                // the instant we tap its back arrow nor log ourselves out
+                // before the rest of the app was seen.
                 val click = current.clickables
                     .filter { !isExercised(current, it) }
-                    .minByOrNull { if (StateOps.isLikelyDismissAction(it)) 1 else 0 }
+                    .minByOrNull { clickPriority(it) }
                 if (click != null) {
                     val landed = exerciseClickable(current, click)
                     current = landed ?: reanchor() ?: relaunchToRoot() ?: break
@@ -414,6 +704,25 @@ class Explorer(
                 }
             }
         }
+    }
+
+    /**
+     * Exercise order on a screen, smallest first: consent / agree affordances
+     * unlock the rest of the screen, so they go first; ordinary content next;
+     * dismiss (back / close / cancel) after the content; destructive elements
+     * dead last (under [DestructivePolicy.LAST] / [DestructivePolicy.CONFIRM_ABORT];
+     * with SKIP they were already flagged and filtered out, with TAP they rank
+     * like content).
+     */
+    private fun clickPriority(c: ClickableRef): Int = when {
+        // An explicit CLICK/LONG_PRESS/SWIPE element rule outranks every
+        // heuristic — including the destructive guard the user opted out of
+        // for this element by writing the rule.
+        elementRuleFor(c)?.behavior?.let { it != ElementBehavior.AVOID } == true -> 0
+        StateOps.isLikelyDestructive(c) && config.destructivePolicy != DestructivePolicy.TAP -> 3
+        StateOps.isLikelyDismissAction(c) -> 2
+        StateOps.isLikelyConsentAccept(c) -> 0
+        else -> 1
     }
 
     /**
@@ -471,8 +780,9 @@ class Explorer(
                 }
             }
             if (st != null && st.id != stepFrom.id) {
-                session.transitions += TransitionEntry(stepFrom.id, st.id, ruleAction)
+                addTransition(TransitionEntry(stepFrom.id, st.id, ruleAction))
                 backLeadsTo[st.id] = stepFrom.id
+                inheritSubtreeRoot(st.id, stepFrom.id)
                 stepFrom = st
                 emit(st.id, "RULE « ${rule.name} »")
                 persist()
@@ -511,7 +821,7 @@ class Explorer(
             // us either). Record a self-loop and fall through to generic
             // exploration — the guard against a rule looping on its own screen.
             if (stepFrom.id == current.id) {
-                session.transitions += TransitionEntry(current.id, current.id, ruleAction, loop = true)
+                addTransition(TransitionEntry(current.id, current.id, ruleAction, loop = true))
                 persist()
             }
             null
@@ -562,7 +872,14 @@ class Explorer(
     private suspend fun prepareStateForExploration(state: StateEntry) {
         if (!preparedStates.add(state.id)) return
         fillTextFieldsOn(state)
-        val harvested = harvestScrolledClickables(state)
+        val scroll = scrollPass(state)
+        if (scroll.stitchedPng != null) {
+            val path = store.writeScrollScreenshot(state.id, scroll.stitchedPng)
+            val sIdx = session.states.indexOfFirst { it.id == state.id }
+            if (sIdx >= 0) session.states[sIdx] = session.states[sIdx].copy(scrollScreenshotPath = path)
+            listener.onLog("  ↕ ${state.id}: stitched scroll capture saved (${scroll.stitchedFrames} frames)")
+        }
+        val harvested = scroll.clickables + pagerSwipeRefs(state) + elementRuleRefs(state)
         if (harvested.isNotEmpty()) {
             val idx = session.states.indexOfFirst { it.id == state.id }
             if (idx >= 0) {
@@ -571,8 +888,176 @@ class Explorer(
                 )
             }
             planned += harvested.size
-            persist()
         }
+        if (scroll.stitchedPng != null || harvested.isNotEmpty()) persist()
+    }
+
+    /** Outcome of the per-state scroll pass: revealed clickables + optional stitched capture. */
+    private class ScrollPassResult(
+        val clickables: List<ClickableRef>,
+        val stitchedPng: ByteArray? = null,
+        val stitchedFrames: Int = 0,
+    )
+
+    /**
+     * Single scroll pass over [source]'s main scrollable container, doing two
+     * jobs at once:
+     *  - harvest the clickables only revealed by scrolling (tagged with the
+     *    number of swipes that bring them into view), and
+     *  - stitch the scrolled frames into one tall screenshot — the same
+     *    scroll-and-stitch capture as the manual mode's « Capture scroll » —
+     *    persisted per state so the detail window can show the whole screen.
+     *
+     * The stitch needs to decode the PNG frames; when that fails (headless
+     * tests feed synthetic bytes) the pass falls back to the lightweight
+     * fingerprint-only harvest loop, which never decodes pixels.
+     */
+    private suspend fun scrollPass(source: StateEntry): ScrollPassResult {
+        if (config.maxScrollFrames <= 0) return ScrollPassResult(emptyList())
+        val first = runCatching { capture() }.getOrNull() ?: return ScrollPassResult(emptyList())
+        val scrollable = ScrollCapture.findScrollable(first.root) ?: return ScrollPassResult(emptyList())
+        if (StateOps.isInsideWheelPicker(scrollable)) return ScrollPassResult(emptyList())
+
+        val stitched = runCatching {
+            ScrollCapture.captureAndStitch(
+                initial = ScrollCapture.Frame(png = first.png, xml = first.xml, root = first.root, scrollDelta = 0),
+                scrollableNode = scrollable,
+                doSwipe = { sw ->
+                    adb.inputSwipe(serial, sw.x, sw.yStart, sw.x, sw.yEnd, sw.durationMs)
+                    delay(config.settleDelayMs)
+                },
+                captureFrame = {
+                    val snap = capture()
+                    snap.png to (snap.xml to snap.root)
+                },
+                maxFrames = config.maxScrollFrames + 1,
+            )
+        }.onFailure {
+            listener.onLog("  ⚠ stitched scroll capture unavailable (${it.message ?: it::class.simpleName}) — falling back to plain harvest")
+        }.getOrNull() ?: return ScrollPassResult(legacyScrollHarvest(source, first, scrollable))
+
+        val steps = stitched.frames.size - 1
+        // Bring the device back to the top so siblings / recovery see `source`
+        // exactly as the caller found it.
+        repeat(steps) {
+            runCatching {
+                adb.inputSwipe(
+                    serial,
+                    stitched.swipe.x, stitched.swipe.yEnd,
+                    stitched.swipe.x, stitched.swipe.yStart,
+                    stitched.swipe.durationMs,
+                )
+            }
+            delay(config.settleDelayMs)
+        }
+
+        // Harvest: same identity rule as the legacy loop — match on class +
+        // id + copy + gesture, NOT bounds (bounds shift while scrolling).
+        fun sig(c: ClickableRef) = "${c.className}|${c.resourceId}|${c.text}|${c.contentDesc}|${c.gesture}"
+        val seen = HashSet<String>().apply { source.clickables.forEach { add(sig(it)) } }
+        val harvested = ArrayList<ClickableRef>()
+        for (i in 1 until stitched.frames.size) {
+            val frameClicks = StateOps.collectClickables(
+                stitched.frames[i].root, config.targetPackage, config.maxClickablesPerState,
+            )
+            for (c in frameClicks) {
+                if (!seen.add(sig(c))) continue
+                harvested += c.copy(scrollToReveal = i)
+            }
+        }
+        if (harvested.isNotEmpty()) {
+            listener.onLog("  ↕ scroll harvest on ${source.id}: +${harvested.size} off-screen clickable(s) over $steps step(s)")
+        }
+        return ScrollPassResult(
+            clickables = harvested,
+            stitchedPng = if (steps > 0) stitched.pngBytes else null,
+            stitchedFrames = stitched.frames.size,
+        )
+    }
+
+    /**
+     * Synthetic page-swipe actions for each horizontal pager / carousel on
+     * [state] (from its saved dump — no extra device round-trip). A swipe-only
+     * onboarding exposes NO clickable Next button: the swipe action is the
+     * only edge that can ever advance it. Each landing page is a fresh state
+     * with its own pager, so the chain walks itself page by page and ends on
+     * the self-loop the last page produces.
+     */
+    private fun pagerSwipeRefs(state: StateEntry): List<ClickableRef> {
+        val xml = runCatching {
+            java.io.File(store.baseDir, state.xmlPath).readText(Charsets.UTF_8)
+        }.getOrNull() ?: return emptyList()
+        val root = DumpParser.parse(xml) ?: return emptyList()
+        val pagers = StateOps.findHorizontalPagers(root)
+        if (pagers.isEmpty()) return emptyList()
+        val refs = pagers.mapNotNull { n ->
+            val b = n.bounds ?: return@mapNotNull null
+            ClickableRef(
+                resourceId = n.resourceId,
+                className = n.className,
+                text = "",
+                contentDesc = n.contentDesc,
+                bounds = SerialBounds.from(b),
+                tapX = (b.left + b.right) / 2,
+                tapY = (b.top + b.bottom) / 2,
+                gesture = ClickableRef.GESTURE_SWIPE_LEFT,
+            )
+        }.filter { p ->
+            state.clickables.none { it.gesture == ClickableRef.GESTURE_SWIPE_LEFT && it.bounds == p.bounds }
+        }
+        if (refs.isNotEmpty()) {
+            listener.onLog("  ⇆ ${state.id}: +${refs.size} horizontal pager swipe(s) planned")
+        }
+        return refs
+    }
+
+    /**
+     * Work items forced onto [state] by CLICK / LONG_PRESS / SWIPE element
+     * rules. Matching nodes are turned into [ClickableRef]s even when the
+     * accessibility tree marks them `clickable="false"` — Compose images and
+     * surfaces frequently handle taps without ever exposing the flag, so the
+     * generic collector can't see them (the STid `vcard_background_csn` card
+     * is exactly this). Every other element of the screen keeps its normal
+     * generic exploration: this is additive, never pass-through.
+     */
+    private fun elementRuleRefs(state: StateEntry): List<ClickableRef> {
+        val engine = ruleEngine ?: return emptyList()
+        val actionable = pkgElementRules.filter { it.behavior != ElementBehavior.AVOID }
+        if (actionable.isEmpty()) return emptyList()
+        val xml = runCatching {
+            java.io.File(store.baseDir, state.xmlPath).readText(Charsets.UTF_8)
+        }.getOrNull() ?: return emptyList()
+        val root = DumpParser.parse(xml) ?: return emptyList()
+        fun key(b: SerialBounds, gesture: String) = "$b|$gesture"
+        val have = state.clickables.mapTo(HashSet()) { key(it.bounds, it.gesture) }
+        val out = ArrayList<ClickableRef>()
+        for (rule in actionable) {
+            val gesture = when (rule.behavior) {
+                ElementBehavior.LONG_PRESS -> ClickableRef.GESTURE_LONG_PRESS
+                ElementBehavior.SWIPE -> ClickableRef.GESTURE_SWIPE_LEFT
+                else -> ClickableRef.GESTURE_TAP
+            }
+            for (node in engine.resolveAllNodes(root, rule.selector)) {
+                val b = node.bounds ?: continue
+                val sb = SerialBounds.from(b)
+                if (!have.add(key(sb, gesture))) continue
+                out += ClickableRef(
+                    resourceId = node.resourceId,
+                    className = node.className,
+                    text = node.text,
+                    contentDesc = node.contentDesc,
+                    bounds = sb,
+                    tapX = (b.left + b.right) / 2,
+                    tapY = (b.top + b.bottom) / 2,
+                    gesture = gesture,
+                )
+                listener.onLog(
+                    "  🎯 ${state.id}: element rule « ${rule.name.ifBlank { rule.selector.label }} » " +
+                        "plans ${rule.behavior} on ${node.label}",
+                )
+            }
+        }
+        return out
     }
 
     /**
@@ -635,7 +1120,7 @@ class Explorer(
             val landed: String? = when (step) {
                 is NavStep.Forward -> {
                     if (step.action.scrollToReveal > 0) scrollDownTimes(step.action.scrollToReveal)
-                    runCatching { adb.inputTap(serial, step.action.tapX, step.action.tapY) }
+                    runCatching { performGesture(step.action) }
                     delay(config.settleDelayMs)
                     val snap = runCatching { capture() }.getOrNull() ?: return null
                     resolveKnownStateId(snap)
@@ -643,10 +1128,12 @@ class Explorer(
                 is NavStep.Back -> climbBackTo(step)
             }
             if (landed == null) {
+                if (step is NavStep.Forward) recordEdgeFailure(step)
                 listener.onLog("  ✘ nav lost on an unknown screen heading for ${target.id}")
                 return null
             }
             if (step is NavStep.Forward && landed != step.to) {
+                recordEdgeFailure(step)
                 listener.onLog("  ↻ ${step.from}→${step.to} actually landed on $landed (stale edge) — re-planning")
             }
             if (landed == curId && step is NavStep.Back) return null // BACK made no progress
@@ -757,35 +1244,145 @@ class Explorer(
         // self-loop without an actual tap so the picker doesn't drift.
         if (click.insideWheelPicker) {
             listener.onLog("  ↺ wheel-picker click « ${click.label} » (synthetic self-loop)")
-            session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+            addTransition(TransitionEntry(source.id, source.id, click, loop = true))
             countProcessed(source.id, click.label); persist()
             return source
         }
 
         listener.onLog(
-            "▶ ${source.id} · tap « ${click.label} »" +
+            "▶ ${source.id} · ${gestureVerb(click)} « ${click.label} »" +
                 if (click.scrollToReveal > 0) " (scroll ${click.scrollToReveal})" else "",
         )
-        val after: Snapshot
+        val preGestureFp = lastLiveFingerprint
+        var after: Snapshot
         try {
             if (click.scrollToReveal > 0) scrollDownTimes(click.scrollToReveal)
-            adb.inputTap(serial, click.tapX, click.tapY)
+            performGesture(click)
             delay(config.settleDelayMs)
             // If the tap kicked off a firmware flash / download / connecting
             // spinner, patiently wait it out so we classify the screen the app
             // moves on to — not the transient progress screen.
             after = waitOutLongOperation(capture())
+            // A tap that changed strictly nothing may have been swallowed by an
+            // overlay (a FAB, a snackbar) covering the element's centre. Retry
+            // once on an off-centre point of the element before concluding it
+            // is a genuine no-op. Pickers / large sibling groups are exempt —
+            // their "no visible change" is expected.
+            if (click.gesture == ClickableRef.GESTURE_TAP &&
+                preGestureFp != null && after.fingerprint == preGestureFp &&
+                click.siblingGroupSize < pickerSiblingThreshold
+            ) {
+                val altX = click.bounds.left + (click.bounds.right - click.bounds.left) / 4
+                if (altX != click.tapX) {
+                    listener.onLog("  ↻ tap had no effect — retrying off-centre ($altX, ${click.tapY})")
+                    adb.inputTap(serial, altX, click.tapY)
+                    delay(config.settleDelayMs)
+                    after = waitOutLongOperation(capture())
+                }
+            }
         } catch (e: Exception) {
             val reason = e.message ?: e::class.simpleName.orEmpty()
             listener.onLog("  ✘ « ${click.label} » failed: $reason")
-            session.transitions += TransitionEntry(source.id, null, click, errorMessage = reason)
+            addTransition(TransitionEntry(source.id, null, click, errorMessage = reason))
             countProcessed(source.id, click.label); persist()
             return null
         }
 
+        // System "app isn't responding" / "app has stopped" dialog: wait it
+        // out (ANR) or dismiss + record the crash, then recover.
+        val stopDialog = StateOps.detectAppStopDialog(after.root)
+        if (stopDialog != null) {
+            return handleAppStopDialog(source, click, stopDialog, after)
+        }
+
+        return classifyLanding(source, click, after)
+    }
+
+    /** Short human verb for the log line, per gesture. */
+    private fun gestureVerb(click: ClickableRef): String = when (click.gesture) {
+        ClickableRef.GESTURE_LONG_PRESS -> "long-press"
+        ClickableRef.GESTURE_SWIPE_LEFT -> "page-swipe"
+        else -> "tap"
+    }
+
+    /** Executes [click]'s gesture on the device (tap, long-press or page-swipe). */
+    private suspend fun performGesture(click: ClickableRef) {
+        when (click.gesture) {
+            ClickableRef.GESTURE_LONG_PRESS ->
+                adb.inputSwipe(serial, click.tapX, click.tapY, click.tapX, click.tapY, LONG_PRESS_MS)
+            ClickableRef.GESTURE_SWIPE_LEFT -> {
+                val b = click.bounds
+                val travel = ((b.right - b.left) * 60) / 100
+                val y = (b.top + b.bottom) / 2
+                val xStart = (b.left + b.right) / 2 + travel / 2
+                adb.inputSwipe(serial, xStart, y, xStart - travel, y, 350)
+            }
+            else -> adb.inputTap(serial, click.tapX, click.tapY)
+        }
+    }
+
+    /**
+     * Resolves a detected ANR / crash dialog. An ANR is given up to two "Wait"
+     * rounds — apps frequently recover, in which case the landing is
+     * classified normally. A crash (or an ANR that never recovers) is
+     * dismissed, recorded as a `crashed` transition annotated with the logcat
+     * FATAL EXCEPTION header when available, and the crawl recovers by
+     * re-anchoring or relaunching.
+     */
+    private suspend fun handleAppStopDialog(
+        source: StateEntry,
+        click: ClickableRef,
+        first: StateOps.AppStopDialog,
+        snap: Snapshot,
+    ): StateEntry? {
+        var dialog = first
+        var current = snap
+        if (dialog.isAnr) {
+            repeat(2) {
+                val wait = dialog.dismissNode ?: return@repeat
+                listener.onLog("  ⏳ ANR « ${dialog.caption} » — pressing Wait")
+                runCatching { tapNode(wait) }
+                delay(config.settleDelayMs + 1_000)
+                current = runCatching { capture() }.getOrNull() ?: return run {
+                    addTransition(TransitionEntry(source.id, null, click, crashed = true, errorMessage = dialog.caption))
+                    countProcessed(source.id, click.label); persist()
+                    reanchor() ?: relaunchToRoot()
+                }
+                val again = StateOps.detectAppStopDialog(current.root)
+                if (again == null) {
+                    listener.onLog("  ✓ app recovered from the ANR")
+                    return classifyLanding(source, click, current)
+                }
+                dialog = again
+            }
+        }
+        val crashLog = runCatching { adb.recentCrashLog(serial, config.targetPackage) }.getOrNull()
+        listener.onLog("  💥 app ${if (dialog.isAnr) "is not responding" else "crashed"}: « ${dialog.caption} »")
+        crashLog?.let { listener.onLog("  💥 $it") }
+        dialog.dismissNode?.let { runCatching { tapNode(it) }; delay(config.settleDelayMs) }
+        addTransition(
+            TransitionEntry(source.id, null, click, crashed = true, errorMessage = crashLog ?: dialog.caption),
+        )
+        countProcessed(source.id, click.label); persist()
+        return reanchor() ?: relaunchToRoot()
+    }
+
+    /** Taps the centre of [node]. */
+    private suspend fun tapNode(node: UiNode) {
+        val b = node.bounds ?: return
+        adb.inputTap(serial, (b.left + b.right) / 2, (b.top + b.bottom) / 2)
+    }
+
+    /**
+     * Classifies the screen the device landed on after [click] was performed
+     * on [source], records the resulting transition(s), and returns the state
+     * the device is now on. Split out of [exerciseClickable] so the ANR
+     * recovery path can re-enter the classification once the app comes back.
+     */
+    private suspend fun classifyLanding(source: StateEntry, click: ClickableRef, after: Snapshot): StateEntry? {
         // System permission dialog: capture + auto-grant; continue on the
         // screen behind the gate.
-        if (after.pkg in StateOps.PERMISSION_PACKAGES) {
+        if (StateOps.isPermissionGatePackage(after.pkg)) {
             val grant = grantPermissionChain(after, source, click, source.pathFromRoot + click)
             countProcessed(source.id, click.label); persist()
             if (grant == null) {
@@ -794,6 +1391,26 @@ class Explorer(
             }
             listener.onLog("  🔓 auto-granted permission(s) → behind ${grant.behind.pkg}")
             return classifyBehindPermission(source, click, grant) ?: reanchor() ?: returnToApp(source)
+        }
+
+        // Landed on the home-screen launcher: the app went away under us —
+        // either it crashed without a dialog (check logcat to attribute it) or
+        // the tap was an exit affordance. The launcher itself is not a state
+        // worth capturing; relaunch and carry on.
+        if (config.targetPackage.isNotBlank() && after.pkg != config.targetPackage &&
+            StateOps.isLauncherPackage(after.pkg)
+        ) {
+            val crashLog = runCatching { adb.recentCrashLog(serial, config.targetPackage) }.getOrNull()
+            if (crashLog != null) {
+                listener.onLog("  💥 app crashed to the launcher after « ${click.label} »")
+                listener.onLog("  💥 $crashLog")
+                addTransition(TransitionEntry(source.id, null, click, crashed = true, errorMessage = crashLog))
+            } else {
+                listener.onLog("  ⇗ landed on the launcher (${after.pkg}) — app exited")
+                addTransition(TransitionEntry(source.id, null, click, leftApp = true))
+            }
+            countProcessed(source.id, click.label); persist()
+            return relaunchToRoot()
         }
 
         // Left the target app (e.g. a tap opened a web page in the browser).
@@ -810,7 +1427,7 @@ class Explorer(
                     .also { fingerprintToId[after.fingerprint] = it.id }.id
             }
             listener.onLog("  ⇗ left app (${after.pkg}) → captured as $externalId")
-            session.transitions += TransitionEntry(source.id, externalId, click, leftApp = true)
+            addTransition(TransitionEntry(source.id, externalId, click, leftApp = true))
             backLeadsTo[externalId] = source.id
             countProcessed(source.id, click.label); persist()
             return returnToApp(source)
@@ -820,7 +1437,7 @@ class Explorer(
         val result: StateEntry = when {
             knownId == source.id -> {
                 listener.onLog("  ↺ self-loop")
-                session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+                addTransition(TransitionEntry(source.id, source.id, click, loop = true))
                 source
             }
             knownId != null && shouldFanOutDetail(source, click, knownId, after) -> {
@@ -832,34 +1449,52 @@ class Explorer(
                 // explore). The fingerprint stays aliased to the canonical state,
                 // so the next sibling fans out the same way.
                 val clone = registerState(after, depth = source.depth + 1, path = source.pathFromRoot + click)
-                session.transitions += TransitionEntry(source.id, clone.id, click)
+                addTransition(TransitionEntry(source.id, clone.id, click))
                 backLeadsTo[clone.id] = source.id
+                inheritSubtreeRoot(clone.id, source.id)
                 exhaustedStates += clone.id
                 listener.onLog("  ✶ detail fan-out → new ${clone.id} (same layout, distinct screenshot)")
                 clone
             }
             knownId != null -> {
                 listener.onLog("  → known state $knownId")
-                session.transitions += TransitionEntry(source.id, knownId, click, loop = false)
+                addTransition(TransitionEntry(source.id, knownId, click, loop = false))
                 session.states.firstOrNull { it.id == knownId } ?: source
             }
             isSelectionWithinSameScreen(source, click, after) -> {
                 listener.onLog("  ↺ same screen — selection in a list/picker (group=${click.siblingGroupSize})")
-                session.transitions += TransitionEntry(source.id, source.id, click, loop = true)
+                addTransition(TransitionEntry(source.id, source.id, click, loop = true))
                 fingerprintToId[after.fingerprint] = source.id
                 source
             }
             else -> {
                 val child = registerState(after, depth = source.depth + 1, path = source.pathFromRoot + click)
                 fingerprintToId[after.fingerprint] = child.id
-                session.transitions += TransitionEntry(source.id, child.id, click)
+                addTransition(TransitionEntry(source.id, child.id, click))
                 backLeadsTo[child.id] = source.id
+                inheritSubtreeRoot(child.id, source.id)
                 listener.onLog("  → new ${child.id} (${child.clickables.size} actions)")
+                // CONFIRM_ABORT: a destructive tap that opened a NEW screen
+                // almost certainly opened its confirmation dialog. Capture it
+                // but never press its buttons — the crawler backs away instead
+                // of confirming the destruction.
+                if (config.destructivePolicy == DestructivePolicy.CONFIRM_ABORT &&
+                    StateOps.isLikelyDestructive(click)
+                ) {
+                    exhaustedStates += child.id
+                    listener.onLog("  ⛔ confirmation screen of destructive « ${click.label} » captured, not confirmed")
+                }
                 child
             }
         }
         countProcessed(source.id, click.label); persist()
         return result
+    }
+
+    /** Propagates the exploration-subtree anchor from [parentId] to [childId]. */
+    private fun inheritSubtreeRoot(childId: String, parentId: String) {
+        val anchor = subtreeRootByStateId[parentId] ?: return
+        subtreeRootByStateId.putIfAbsent(childId, anchor)
     }
 
     /**
@@ -904,7 +1539,7 @@ class Explorer(
         repeat(PERMISSION_FLOW_MAX_STEPS) {
             when {
                 // The screen behind the gate has been reached — done.
-                current.pkg !in StateOps.PERMISSION_PACKAGES &&
+                !StateOps.isPermissionGatePackage(current.pkg) &&
                     current.pkg !in StateOps.PERMISSION_SETTINGS_PACKAGES -> {
                     val did = prevDialogId
                     val act = prevAllow
@@ -941,14 +1576,19 @@ class Explorer(
                     // Wire the incoming edge: source→firstDialog, then dialog→dialog.
                     if (prevDialogId == null) {
                         if (incomingFrom != null && incomingAction != null) {
-                            session.transitions += TransitionEntry(incomingFrom.id, dialog.id, incomingAction)
+                            addTransition(TransitionEntry(incomingFrom.id, dialog.id, incomingAction))
                         }
                     } else {
-                        session.transitions += TransitionEntry(prevDialogId, dialog.id, prevAllow!!)
+                        addTransition(TransitionEntry(prevDialogId, dialog.id, prevAllow!!))
                     }
                     persist()
 
-                    val node = StateOps.findPermissionAllowNode(current.root)
+                    // GMS / Bluetooth gate dialogs don't carry a literal
+                    // "Allow"; widen to the generic positive affordances there.
+                    val node = StateOps.findPermissionAllowNode(
+                        current.root,
+                        includeGatePositives = current.pkg in StateOps.SYSTEM_GATE_PACKAGES,
+                    )
                     if (node == null) {
                         listener.onLog("  ⚠ no Allow button on permission dialog ${dialog.id}")
                         return null
@@ -995,15 +1635,17 @@ class Explorer(
                 ?: registerExternalState(behind, source.pathFromRoot + click)
                     .also { fingerprintToId[behind.fingerprint] = it.id }.id
             listener.onLog("  ⇗ behind permission left the app (${behind.pkg}) → captured as $externalId")
-            session.transitions += TransitionEntry(grant.lastDialogId, externalId, grant.lastAllowAction, leftApp = true)
+            addTransition(TransitionEntry(grant.lastDialogId, externalId, grant.lastAllowAction, leftApp = true))
             backLeadsTo[externalId] = source.id
             return returnToApp(source)
         }
         val knownId = fingerprintToId[behind.fingerprint]
         if (knownId != null) {
             listener.onLog("  → behind permission → known state $knownId")
-            session.transitions += TransitionEntry(
-                grant.lastDialogId, knownId, grant.lastAllowAction, loop = knownId == grant.lastDialogId,
+            addTransition(
+                TransitionEntry(
+                    grant.lastDialogId, knownId, grant.lastAllowAction, loop = knownId == grant.lastDialogId,
+                ),
             )
             // Post-grant shortcut: tapping the trigger on `source` now lands
             // straight on this screen (the dialog is gone).
@@ -1016,8 +1658,9 @@ class Explorer(
             path = source.pathFromRoot + click,
         )
         fingerprintToId[behind.fingerprint] = child.id
-        session.transitions += TransitionEntry(grant.lastDialogId, child.id, grant.lastAllowAction)
+        addTransition(TransitionEntry(grant.lastDialogId, child.id, grant.lastAllowAction))
         backLeadsTo[child.id] = source.id
+        inheritSubtreeRoot(child.id, source.id)
         navShortcuts += NavStep.Forward(source.id, child.id, click)
         listener.onLog("  → new ${child.id} behind permission (${child.clickables.size} actions)")
         emit(child.id, null)
@@ -1045,9 +1688,10 @@ class Explorer(
             xmlPath = xmlPath,
             clickables = emptyList(),
             pathFromRoot = path,
+            activity = snap.activity,
         )
         session.states += entry
-        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        indexStateIdentity(id, snap)
         // Flag it as one-time: navigation must never try to route back through
         // this dialog, because once granted the system won't show it again.
         permissionDialogStateIds += id
@@ -1074,9 +1718,10 @@ class Explorer(
             xmlPath = xmlPath,
             clickables = emptyList(),
             pathFromRoot = path,
+            activity = snap.activity,
         )
         session.states += entry
-        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        indexStateIdentity(id, snap)
         listener.onLog("  📸 captured external screen (${snap.pkg}) as $id")
         return entry
     }
@@ -1105,7 +1750,7 @@ class Explorer(
     private suspend fun replaySteps(steps: List<ClickableRef>) {
         for (step in steps) {
             if (step.scrollToReveal > 0) scrollDownTimes(step.scrollToReveal)
-            adb.inputTap(serial, step.tapX, step.tapY)
+            performGesture(step)
             delay(config.settleDelayMs)
         }
     }
@@ -1131,32 +1776,28 @@ class Explorer(
     }
 
     /**
-     * Scrolls [source] (the screen the device is currently on) downward up to
-     * [ExplorationConfig.maxScrollFrames] times, collecting clickables that
+     * Fingerprint-only fallback of [scrollPass]: scrolls [source] downward up
+     * to [ExplorationConfig.maxScrollFrames] times, collecting clickables that
      * weren't visible at scroll 0. Each newly-found clickable is tagged with
      * the number of scrolls that reveal it (its recorded bounds are its
      * *revealed* on-screen position) so the explorer can scroll-then-tap it and
      * replay it later. The device is returned to the top before this returns,
-     * leaving `source` exactly as the caller found it.
-     *
-     * Wheel pickers (NumberPicker/DatePicker/TimePicker) are skipped: they are
-     * `scrollable` too, but "scrolling" them only rotates labels — harvesting
-     * those would resurrect the very state explosion the wheel-picker
-     * short-circuit exists to prevent.
+     * leaving `source` exactly as the caller found it. No pixels are decoded —
+     * this is the path headless tests (synthetic PNG bytes) exercise.
      */
-    private suspend fun harvestScrolledClickables(source: StateEntry): List<ClickableRef> {
-        if (config.maxScrollFrames <= 0) return emptyList()
-        val first = runCatching { capture() }.getOrNull() ?: return emptyList()
-        val scrollable = ScrollCapture.findScrollable(first.root) ?: return emptyList()
-        if (StateOps.isInsideWheelPicker(scrollable)) return emptyList()
+    private suspend fun legacyScrollHarvest(
+        source: StateEntry,
+        first: Snapshot,
+        scrollable: UiNode,
+    ): List<ClickableRef> {
         val b0 = scrollable.bounds ?: return emptyList()
         val midX = (b0.left + b0.right) / 2
         val travel = (b0.height * 70) / 100
         val centerY = (b0.top + b0.bottom) / 2
 
         // Don't re-add anything already exposed at scroll 0. Match on identity
-        // (class + id + copy), NOT bounds, since bounds shift as we scroll.
-        fun sig(c: ClickableRef) = "${c.className}|${c.resourceId}|${c.text}|${c.contentDesc}"
+        // (class + id + copy + gesture), NOT bounds, since bounds shift as we scroll.
+        fun sig(c: ClickableRef) = "${c.className}|${c.resourceId}|${c.text}|${c.contentDesc}|${c.gesture}"
         val seen = HashSet<String>().apply { source.clickables.forEach { add(sig(it)) } }
 
         val harvested = ArrayList<ClickableRef>()
@@ -1212,19 +1853,38 @@ class Explorer(
      * let the fix-up pass retry later.
      */
     private suspend fun recoverTo(target: StateEntry, path: List<ClickableRef>): Boolean {
-        listener.onLog("  ↻ recover → ${target.id} (relaunch + replay ${path.size} taps)")
+        // A state discovered through a direct `am start -n` launch (manifest
+        // coverage) — or below one — is re-reached deterministically by
+        // relaunching its anchor component, not by replaying from the app root.
+        val anchorId = subtreeRootByStateId[target.id]
+        val anchorComponent = anchorId
+            ?.let { aId -> session.states.firstOrNull { it.id == aId } }
+            ?.directLaunchComponent
+        listener.onLog(
+            "  ↻ recover → ${target.id} " +
+                if (anchorComponent != null) "(am start $anchorComponent + replay ${path.size} taps)"
+                else "(relaunch + replay ${path.size} taps)",
+        )
         return try {
-            adb.launchApp(serial, config.targetPackage)
+            if (anchorComponent != null) {
+                if (!adb.startActivity(serial, anchorComponent)) {
+                    listener.onLog("  ✘ am start $anchorComponent failed")
+                    return false
+                }
+                delay(config.settleDelayMs + 300)
+            } else {
+                adb.launchApp(serial, config.targetPackage)
+            }
             val landed = waitForKnownState()
             if (landed == null) {
                 listener.onLog("  ✘ no known state appeared after launch")
                 return false
             }
-            val rootId = rootStateId
-            val suffix = if (landed.id == rootId) {
+            val startId = anchorId ?: rootStateId
+            val suffix = if (landed.id == startId) {
                 path
             } else {
-                val skipped = pathSuffixFrom(landed.id, path) ?: run {
+                val skipped = pathSuffixFrom(landed.id, path, startId) ?: run {
                     listener.onLog("  ✘ landed on ${landed.id} but it's not on the path to ${target.id}")
                     return false
                 }
@@ -1262,8 +1922,11 @@ class Explorer(
             // "Only this time" grant re-asking) must be auto-allowed rather
             // than mistaken for the screen we're waiting for — tap through it
             // quietly (it was already captured on the first pass) and retry.
-            if (snap != null && snap.pkg in StateOps.PERMISSION_PACKAGES) {
-                val node = StateOps.findPermissionAllowNode(snap.root)
+            if (snap != null && StateOps.isPermissionGatePackage(snap.pkg)) {
+                val node = StateOps.findPermissionAllowNode(
+                    snap.root,
+                    includeGatePositives = snap.pkg in StateOps.SYSTEM_GATE_PACKAGES,
+                )
                 val b = node?.bounds
                 if (b != null) {
                     listener.onLog("  🔓 auto-granting permission during recovery")
@@ -1291,14 +1954,17 @@ class Explorer(
      * edges are ignored — we only follow forward transitions whose action
      * matches the corresponding [ClickableRef] by resource id + bounds.
      */
-    private fun pathSuffixFrom(landedId: String, path: List<ClickableRef>): List<ClickableRef>? {
-        val rootId = rootStateId ?: return null
+    private fun pathSuffixFrom(
+        landedId: String,
+        path: List<ClickableRef>,
+        startId: String? = rootStateId,
+    ): List<ClickableRef>? {
+        val rootId = startId ?: return null
         if (landedId == rootId) return path
         var current = rootId
         for ((index, action) in path.withIndex()) {
-            val nextId = session.transitions.firstOrNull { t ->
-                t.from == current &&
-                    t.to != null &&
+            val nextId = transitionsByFrom[current].orEmpty().firstOrNull { t ->
+                t.to != null &&
                     !t.loop &&
                     t.errorMessage == null &&
                     t.action.resourceId == action.resourceId &&
@@ -1324,39 +1990,38 @@ class Explorer(
      * [ExplorationConfig.maxStates].
      */
     private fun branchDepth(stateId: String): Int {
-        val root = rootStateId ?: return 0
+        // States in a direct-launch subtree measure their depth from their own
+        // anchor — the manifest-coverage phase starts a fresh tree per launch.
+        val root = subtreeRootByStateId[stateId] ?: rootStateId ?: return 0
         if (stateId == root) return 0
-        val forward = HashMap<String, MutableSet<String>>()
-        for (t in session.transitions) {
-            if (t.to == null || t.loop || t.leftApp || t.errorMessage != null) continue
-            if (t.to == t.from) continue
-            forward.getOrPut(t.from) { HashSet() }.add(t.to)
-        }
-        // BFS shortest path root → stateId, keeping parent pointers.
+        // BFS shortest path root → stateId over the incrementally-maintained
+        // forward adjacency, keeping parent pointers. (The adjacency used to be
+        // rebuilt from the full transition list on every call — quadratic in
+        // session size once a crawl reaches hundreds of transitions.)
         val parent = HashMap<String, String>()
         val visited = HashSet<String>().apply { add(root) }
         val queue = ArrayDeque<String>().apply { add(root) }
         while (queue.isNotEmpty()) {
             val n = queue.removeFirst()
             if (n == stateId) break
-            for (m in forward[n].orEmpty()) if (visited.add(m)) { parent[m] = n; queue += m }
+            for (m in forwardAdj[n].orEmpty()) if (visited.add(m)) { parent[m] = n; queue += m }
         }
         if (stateId !in visited) return 0 // only reachable via a cross-edge — treat as shallow
         var depth = 0
         var cur = stateId
         while (cur != root) {
             val p = parent[cur] ?: break
-            if ((forward[p]?.size ?: 0) >= 2) depth++
+            if ((forwardAdj[p]?.size ?: 0) >= 2) depth++
             cur = p
         }
         return depth
     }
 
     private fun isExercised(source: StateEntry, click: ClickableRef): Boolean =
-        session.transitions.any { t ->
-            t.from == source.id &&
-                t.action.resourceId == click.resourceId &&
-                t.action.bounds == click.bounds
+        transitionsByFrom[source.id].orEmpty().any { t ->
+            t.action.resourceId == click.resourceId &&
+                t.action.bounds == click.bounds &&
+                t.action.gesture == click.gesture
         }
 
     /**
@@ -1392,6 +2057,9 @@ class Explorer(
                 listener.onLog("  ⚠ could not fill « ${f.label} »: ${it.message ?: it::class.simpleName}")
             }
         }
+        // The IME opened by the field taps can cover half the screen and steal
+        // every subsequent tap — dismiss it before the buttons are exercised.
+        runCatching { adb.hideIme(serial) }
     }
 
     /**
@@ -1487,13 +2155,18 @@ class Explorer(
         val pkg = StateOps.dominantPackage(root)
         val fp = StateOps.fingerprint(root)
         lastLiveFingerprint = fp
-        return Snapshot(idle.png, xml, root, pkg, fp)
+        // Best-effort: the foreground Activity is a strong dedup signal and
+        // feeds the coverage report; `null` (fake gateways, locked-down OEMs)
+        // simply disables the activity-based vetoes.
+        val activity = runCatching { adb.currentFocusedActivity(serial) }.getOrNull()
+        return Snapshot(idle.png, xml, root, pkg, fp, activity)
     }
 
     private fun registerState(
         snap: Snapshot,
         depth: Int,
         path: List<ClickableRef>,
+        directLaunchComponent: String? = null,
     ): StateEntry {
         val id = "S${session.states.size}"
         val screenshotPath = store.writeScreenshot(id, snap.png)
@@ -1508,17 +2181,30 @@ class Explorer(
             xmlPath = xmlPath,
             clickables = clickables,
             pathFromRoot = path,
+            activity = snap.activity,
+            directLaunchComponent = directLaunchComponent,
         )
         session.states += entry
-        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
-        resourceIdsByStateId[id] = StateOps.screenResourceIds(snap.root, config.targetPackage)
+        indexStateIdentity(id, snap)
         // Record the screen's root-container id so future captures of the same
         // screen (different toggle / scroll / selection) resolve back to it
         // instead of registering a near-duplicate. First writer wins.
         StateOps.rootScreenId(snap.root, config.targetPackage)?.let { rid ->
             rootIdToStateId.putIfAbsent(rid, id)
         }
+        if (directLaunchComponent != null) subtreeRootByStateId[id] = id
         return entry
+    }
+
+    /** Identity bookkeeping shared by every state-registration path. */
+    private fun indexStateIdentity(id: String, snap: Snapshot) {
+        structureFingerprintByStateId[id] = StateOps.structureFingerprint(snap.root)
+        resourceIdsByStateId[id] = StateOps.screenResourceIds(snap.root, config.targetPackage)
+        normalizedFpToId.putIfAbsent(StateOps.normalizedFingerprint(snap.root), id)
+        snap.activity?.let { act ->
+            activityByStateId[id] = act
+            visitedActivities += act
+        }
     }
 
     /**
@@ -1532,8 +2218,26 @@ class Explorer(
      */
     private fun resolveKnownStateId(snap: Snapshot): String? {
         fingerprintToId[snap.fingerprint]?.let { return it }
+
+        // Tier 2: normalized fingerprint — the same screen with only a digit
+        // run changed (a counter, a clock, a percentage). Vetoed when the two
+        // captures are hosted by different Activities: a wizard whose steps
+        // differ only by a step number must not collapse across screens.
+        val normFp = StateOps.normalizedFingerprint(snap.root)
+        normalizedFpToId[normFp]?.let { id ->
+            if (activitiesCompatible(id, snap)) {
+                fingerprintToId[snap.fingerprint] = id
+                mergeRevealedClickables(id, snap)
+                return id
+            }
+        }
+
+        // Tier 3: the screen's root container id.
         val rid = StateOps.rootScreenId(snap.root, config.targetPackage) ?: return null
         val stateId = rootIdToStateId[rid] ?: return null
+        // Two screens hosted by different Activities are never the same state,
+        // however much their trees overlap.
+        if (!activitiesCompatible(stateId, snap)) return null
         // The root-container id matches a known state, but that alone over-merges
         // when the id is a generic app shell (e.g. `root_app`) shared by unrelated
         // screens. Only treat this as the same screen when the two share most of
@@ -1547,6 +2251,13 @@ class Explorer(
         fingerprintToId[snap.fingerprint] = stateId
         mergeRevealedClickables(stateId, snap)
         return stateId
+    }
+
+    /** `false` only when both sides expose a foreground Activity and they differ. */
+    private fun activitiesCompatible(stateId: String, snap: Snapshot): Boolean {
+        val known = activityByStateId[stateId] ?: return true
+        val live = snap.activity ?: return true
+        return known == live
     }
 
     /** Overlap ratio |A∩B| / |A∪B|; 0 when both sets are empty. */
@@ -1630,7 +2341,18 @@ class Explorer(
         )
     }
 
-    private fun persist() {
+    private var lastPersistAt = 0L
+
+    /**
+     * Saves the session and notifies the UI, throttled: a crawl records a
+     * transition every action, and re-serialising the whole session to disk
+     * for each one is pure overhead. [force] bypasses the throttle for
+     * must-not-lose moments (session end, abort paths).
+     */
+    private fun persist(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastPersistAt < PERSIST_THROTTLE_MS) return
+        lastPersistAt = now
         store.save(session)
         listener.onSessionUpdated(session)
     }
@@ -1657,6 +2379,15 @@ class Explorer(
 
         /** Poll interval while waiting out a long-running operation screen. */
         const val LONG_OP_POLL_MS = 3_000L
+
+        /** Duration of the press-and-hold gesture for long-clickable nodes. */
+        const val LONG_PRESS_MS = 800
+
+        /** Recorded forward edges are pruned from navigation after this many failed replays. */
+        const val EDGE_FAILURES_BEFORE_PRUNE = 2
+
+        /** Minimum interval between two un-forced session saves. */
+        const val PERSIST_THROTTLE_MS = 1_000L
 
         /**
          * Minimum resource-id overlap (Jaccard) for two screens that share a

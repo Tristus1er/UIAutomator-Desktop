@@ -330,27 +330,36 @@ object ScrollCapture {
 
             // Sticky bands: take the max we've ever observed. A first scroll
             // may briefly leave the FAB or app bar in place — we want the
-            // largest stable sticky region across the whole sequence.
-            stickyTopH = max(
+            // largest stable sticky region across the whole sequence. The
+            // values are only COMMITTED below once the frame proves to carry
+            // a real scroll: when the list end is reached the two frames are
+            // identical, every row reads as "sticky", and folding that
+            // degenerate measurement in would collapse the live zone to
+            // nothing and corrupt the stitching geometry.
+            val candidateTopH = max(
                 stickyTopH,
                 detectStickyTopHeight(prevImage, nextImg, scrollable.top, scrollable.bottom),
             )
-            stickyBottomH = max(
+            val candidateBottomH = max(
                 stickyBottomH,
                 detectStickyBottomHeight(prevImage, nextImg, scrollable.top, scrollable.bottom),
             )
 
-            val liveTopNow = scrollable.top + stickyTopH
-            val liveBottomNow = scrollable.bottom - stickyBottomH
-            // Defensive: if sticky bands eat the whole container, bail.
+            val liveTopNow = scrollable.top + candidateTopH
+            val liveBottomNow = scrollable.bottom - candidateBottomH
+            // Defensive: if sticky bands eat the whole container, bail. This is
+            // also where two identical frames (end of list) land.
             if (liveBottomNow - liveTopNow < 8) break
 
             val dy = detectScrollDelta(prevImage, nextImg, liveTopNow, liveBottomNow)
             if (dy == 0) {
                 // End of list — discard the frame we just captured (it carries
-                // no new pixels) and stop the loop.
+                // no new pixels, and its sticky reading is meaningless) and
+                // stop the loop.
                 break
             }
+            stickyTopH = candidateTopH
+            stickyBottomH = candidateBottomH
             frames += Frame(png = nextPng, xml = nextXml, root = nextRoot, scrollDelta = dy)
             prevImage = nextImg
         }

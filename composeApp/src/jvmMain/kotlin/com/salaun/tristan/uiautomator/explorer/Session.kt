@@ -3,6 +3,33 @@ package com.salaun.tristan.uiautomator.explorer
 import com.salaun.tristan.uiautomator.model.UiBounds
 import kotlinx.serialization.Serializable
 
+/**
+ * What the explorer does with a clickable whose label / id marks it as
+ * *destructive* (logout, delete, reset, purchase, call… — see
+ * [com.salaun.tristan.uiautomator.explorer.StateOps.isLikelyDestructive]).
+ * One mis-tap on "Sign out" can strand every screen behind the login gate for
+ * the rest of the crawl, so the default is the safest policy.
+ */
+@Serializable
+enum class DestructivePolicy {
+    /** Never tap it. A `skipped` transition is recorded so the graph shows it was seen. */
+    SKIP,
+
+    /** Tap it, but only after every other element of the screen is exhausted. */
+    LAST,
+
+    /**
+     * Tap it last; if the tap lands on a *new* screen (almost always a
+     * confirmation dialog), that screen is captured but immediately marked
+     * exhausted so its confirm button is never pressed — the crawler captures
+     * the dialog then backs away.
+     */
+    CONFIRM_ABORT,
+
+    /** Legacy behavior: treat it like any other clickable. */
+    TAP,
+}
+
 @Serializable
 data class ExplorationConfig(
     val targetPackage: String,
@@ -49,6 +76,16 @@ data class ExplorationConfig(
      * genuinely stuck. 0 disables the extended wait.
      */
     val longOperationMaxWaitMs: Long = 300_000,
+    /** Policy applied to destructive-looking clickables (logout / delete / buy / call…). */
+    val destructivePolicy: DestructivePolicy = DestructivePolicy.SKIP,
+    /**
+     * When `true`, exported activities declared in the package manifest that
+     * the UI crawl never reached are launched directly (`am start -n`) at the
+     * end of the exploration and explored from there. This reaches screens
+     * only accessible through deep links or conditional flows, and makes the
+     * coverage report meaningful.
+     */
+    val launchUnvisitedActivities: Boolean = true,
 )
 
 @Serializable
@@ -88,16 +125,35 @@ data class ClickableRef(
      * first, then tap. Default 0 keeps older serialised sessions valid.
      */
     val scrollToReveal: Int = 0,
+    /**
+     * The gesture this ref represents: [GESTURE_TAP] (default — a plain tap),
+     * [GESTURE_LONG_PRESS] (a long press on a `long-clickable` node, which
+     * opens context menus invisible to taps), or [GESTURE_SWIPE_LEFT] (a
+     * forward page-swipe on a horizontal pager / carousel — the only way to
+     * advance swipe-only onboardings that expose no Next button). Default
+     * keeps older serialised sessions readable as-is.
+     */
+    val gesture: String = GESTURE_TAP,
 ) {
     val label: String get() {
         val cls = className.substringAfterLast('.').ifBlank { className }
         val id = resourceId.substringAfterLast('/').ifBlank { "" }
         val txt = text.ifBlank { contentDesc }
         return buildString {
+            when (gesture) {
+                GESTURE_LONG_PRESS -> append("⊙ ")
+                GESTURE_SWIPE_LEFT -> append("⇆ ")
+            }
             append(cls)
             if (id.isNotBlank()) append("#").append(id)
             if (txt.isNotBlank()) append(" \"").append(txt.take(30)).append('"')
         }
+    }
+
+    companion object {
+        const val GESTURE_TAP = "tap"
+        const val GESTURE_LONG_PRESS = "longPress"
+        const val GESTURE_SWIPE_LEFT = "swipeLeft"
     }
 }
 
@@ -115,9 +171,32 @@ data class StateEntry(
     val packageName: String,
     val depth: Int,
     val screenshotPath: String,
+    /**
+     * Optional stitched scroll capture of the whole screen (the same
+     * scroll-and-stitch pass as the manual mode's « Capture scroll »), taken
+     * when the screen scrolled during exploration. The graph cards keep
+     * showing [screenshotPath]; the detail window offers this full view.
+     * `null` for non-scrolling screens and for sessions recorded before the
+     * feature existed.
+     */
+    val scrollScreenshotPath: String? = null,
     val xmlPath: String,
     val clickables: List<ClickableRef>,
     val pathFromRoot: List<ClickableRef>,
+    /**
+     * Fully-qualified name of the Activity that hosted this screen when it was
+     * captured (from `dumpsys activity`), or `null` when unavailable. Serves
+     * as a strong extra identity signal during state dedup and feeds the
+     * end-of-run activity coverage report. Default keeps old sessions readable.
+     */
+    val activity: String? = null,
+    /**
+     * Component (`pkg/cls`) this state was reached through when it was opened
+     * directly with `am start -n` (manifest-coverage phase) rather than by
+     * tapping through the UI. Recovery for this state and its descendants
+     * re-launches this component instead of replaying taps from the app root.
+     */
+    val directLaunchComponent: String? = null,
 )
 
 @Serializable
@@ -128,6 +207,10 @@ data class TransitionEntry(
     val leftApp: Boolean = false,
     val loop: Boolean = false,
     val errorMessage: String? = null,
+    /** The action crashed the app (crash dialog detected, or a FATAL EXCEPTION in logcat). */
+    val crashed: Boolean = false,
+    /** The action was deliberately NOT performed ([DestructivePolicy.SKIP] on a destructive element). */
+    val skipped: Boolean = false,
 )
 
 @Serializable

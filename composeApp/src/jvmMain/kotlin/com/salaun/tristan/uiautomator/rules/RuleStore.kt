@@ -42,10 +42,10 @@ class RuleStore(val rootDir: File = defaultRoot()) {
             .getOrElse { PackageRuleSet(packageName = pkg) }
     }
 
-    /** Writes [set]. Deletes the file (and assets) entirely when it has no rules. */
+    /** Writes [set]. Deletes the file (and assets) entirely when it has no rules at all. */
     fun save(set: PackageRuleSet) {
         val f = fileFor(set.packageName)
-        if (set.rules.isEmpty()) {
+        if (set.rules.isEmpty() && set.elementRules.isEmpty()) {
             if (f.isFile) f.delete()
             return
         }
@@ -88,6 +88,7 @@ class RuleStore(val rootDir: File = defaultRoot()) {
                     ruleCount = set.rules.size,
                     enabledCount = set.rules.count { it.enabled },
                     totalActions = set.rules.sumOf { it.routine.size },
+                    elementRuleCount = set.elementRules.size,
                 )
             }
             ?.sortedBy { it.packageName }
@@ -111,4 +112,5 @@ data class PackageRuleSummary(
     val ruleCount: Int,
     val enabledCount: Int,
     val totalActions: Int,
+    val elementRuleCount: Int = 0,
 )

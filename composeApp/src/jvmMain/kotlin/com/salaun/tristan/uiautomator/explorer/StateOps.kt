@@ -38,6 +38,46 @@ object StateOps {
     )
 
     /**
+     * Non-permission system packages that mount *gate* dialogs over the app:
+     * the Google Play Services "turn on Bluetooth / Location" prompt, the
+     * Bluetooth enable confirmation. Like permission dialogs they block the
+     * feature behind a single positive button, so the explorer resolves them
+     * through the same auto-grant machinery — with the wider
+     * positive-affordance patterns of [GATE_POSITIVE_PATTERNS].
+     */
+    val SYSTEM_GATE_PACKAGES: Set<String> = setOf(
+        "com.google.android.gms",
+        "com.android.bluetooth",
+    )
+
+    /** `true` for any package whose dialogs the auto-grant chain may resolve. */
+    fun isPermissionGatePackage(pkg: String): Boolean =
+        pkg in PERMISSION_PACKAGES || pkg in SYSTEM_GATE_PACKAGES
+
+    /**
+     * Home-screen launchers. Landing on one of these after a tap means the
+     * app went away under us (a crash, a finish(), an exit menu) — there is
+     * nothing to capture or explore there, the only sane move is to relaunch
+     * the target app. Matched by exact package or by the "launcher" naming
+     * convention every OEM follows.
+     */
+    private val LAUNCHER_PACKAGES = setOf(
+        "com.google.android.apps.nexuslauncher",
+        "com.android.launcher",
+        "com.android.launcher2",
+        "com.android.launcher3",
+        "com.sec.android.app.launcher",
+        "com.miui.home",
+        "com.huawei.android.launcher",
+        "net.oneplus.launcher",
+        "com.oppo.launcher",
+        "com.coloros.launcher",
+    )
+
+    fun isLauncherPackage(pkg: String): Boolean =
+        pkg in LAUNCHER_PACKAGES || pkg.contains("launcher", ignoreCase = true)
+
+    /**
      * System Settings packages a permission flow may bounce through: some apps
      * deep-link the user to "App info" / a special-access page and let the
      * runtime permission dialog pop over it (Laqi does exactly this for
@@ -91,6 +131,35 @@ object StateOps {
         "no thanks",
         "not now",
         "pas maintenant",
+        "cancel",
+        "annuler",
+        "later",
+        "plus tard",
+    )
+
+    /**
+     * Positive affordances on non-permission system gate dialogs (a GMS
+     * "turn on Location" prompt, a Bluetooth enable confirmation). Tried only
+     * AFTER the permission-specific [PERMISSION_ALLOW_PATTERNS] so a dialog
+     * offering a real "Allow" still resolves to it first. Single short words
+     * ("ok", "oui") are matched as whole tokens, not substrings — see
+     * [findPermissionAllowNode] — so "ok" can't match inside "look".
+     */
+    private val GATE_POSITIVE_PATTERNS = listOf(
+        "turn on",
+        "enable",
+        "activer",
+        "got it",
+        "compris",
+        "i agree",
+        "agree",
+        "accept",
+        "accepter",
+        "continue",
+        "continuer",
+        "ok",
+        "oui",
+        "yes",
     )
 
     /**
@@ -115,12 +184,28 @@ object StateOps {
      * mode (when available) freezes those values; this filter is the
      * defence-in-depth fallback for devices where demo mode is rejected.
      */
-    fun fingerprint(root: UiNode): String {
+    fun fingerprint(root: UiNode): String = fingerprintInternal(root, maskDigits = false)
+
+    /**
+     * Variant of [fingerprint] where every digit run in the labelled text /
+     * content-desc is collapsed to `#`. Two captures of the same screen whose
+     * only difference is a counter, a timestamp or a percentage ("3
+     * notifications" vs "4 notifications", "12:05" vs "12:06") share the same
+     * normalized fingerprint. Used as a *secondary* dedup tier — never as the
+     * canonical identity — and only honoured when the foreground activity
+     * matches, so wizard steps that genuinely differ by a step number don't
+     * collapse across activities.
+     */
+    fun normalizedFingerprint(root: UiNode): String = fingerprintInternal(root, maskDigits = true)
+
+    private val DIGIT_RUN = Regex("\\d+")
+
+    private fun fingerprintInternal(root: UiNode, maskDigits: Boolean): String {
         val digest = MessageDigest.getInstance("SHA-1")
         fun visit(n: UiNode) {
             if (n.packageName in SYSTEM_UI_PACKAGES) return
-            val labelledText: String
-            val labelledDesc: String
+            var labelledText: String
+            var labelledDesc: String
             if (n.resourceId.isNotBlank()) {
                 // The *typed content* of an editable field is user data, not
                 // structure: the explorer auto-fills empty fields, and a filled
@@ -133,6 +218,10 @@ object StateOps {
             } else {
                 labelledText = ""
                 labelledDesc = ""
+            }
+            if (maskDigits) {
+                labelledText = DIGIT_RUN.replace(labelledText, "#")
+                labelledDesc = DIGIT_RUN.replace(labelledDesc, "#")
             }
             val line = buildString {
                 append(n.className); append('|')
@@ -189,7 +278,7 @@ object StateOps {
      * using the app", never to the deny button just because its label happens
      * to contain the substring "allow".
      */
-    fun findPermissionAllowNode(root: UiNode): UiNode? {
+    fun findPermissionAllowNode(root: UiNode, includeGatePositives: Boolean = false): UiNode? {
         val candidates = ArrayList<UiNode>()
         root.walk { n ->
             if (!n.clickable || !n.enabled) return@walk
@@ -199,15 +288,32 @@ object StateOps {
             if (PERMISSION_DENY_PATTERNS.any { haystack.contains(it) }) return@walk
             candidates += n
         }
-        for (pattern in PERMISSION_ALLOW_PATTERNS) {
+        val patterns = if (includeGatePositives) {
+            PERMISSION_ALLOW_PATTERNS + GATE_POSITIVE_PATTERNS
+        } else {
+            PERMISSION_ALLOW_PATTERNS
+        }
+        for (pattern in patterns) {
             val match = candidates.firstOrNull { n ->
                 val haystack = (n.text + " " + n.contentDesc).lowercase()
-                haystack.contains(pattern)
+                matchesPattern(haystack, pattern)
             }
             if (match != null) return match
         }
         return null
     }
+
+    /**
+     * Substring match for multi-word phrases; whole-token match for single
+     * short words, so "ok" / "oui" / "yes" can't fire inside an unrelated
+     * word ("look", "ouija", "eyes").
+     */
+    private fun matchesPattern(haystack: String, pattern: String): Boolean =
+        if (pattern.length <= 4 && ' ' !in pattern) {
+            haystack.split(' ', '\n', '\t', ',', '.', '!', '…').any { it == pattern }
+        } else {
+            haystack.contains(pattern)
+        }
 
     /**
      * `true` when [node] is an editable text field. EditText is the reliable
@@ -279,6 +385,144 @@ object StateOps {
             id.contains("close_button") || id.contains("btn_close") || id.contains("toolbar_back")
         val textHit = c.contentDesc.trim().lowercase() in DISMISS_WORDS || c.text.trim().lowercase() in DISMISS_WORDS
         return idHit || textHit
+    }
+
+    // -- App-stop (ANR / crash) dialogs ---------------------------------------
+
+    /** Captions of the system "Application Not Responding" dialog. */
+    private val ANR_PHRASES = listOf(
+        "isn't responding",
+        "is not responding",
+        "not responding",
+        "ne répond pas",
+        "ne repond pas",
+    )
+
+    /** Captions of the system crash dialog. */
+    private val CRASH_PHRASES = listOf(
+        "has stopped",
+        "keeps stopping",
+        "s'est arrêté",
+        "s'est arrêtée",
+        "s'est arrete",
+        "continue de s'arrêter",
+        "continue de s'arreter",
+        "a cessé de fonctionner",
+        "a cesse de fonctionner",
+    )
+
+    /** "Wait" affordances on the ANR dialog (preferred: gives the app a chance to recover). */
+    private val ANR_WAIT_PATTERNS = listOf("wait", "attendre", "patienter")
+
+    /** Dismiss affordances on crash / unrecovered-ANR dialogs. */
+    private val STOP_CLOSE_PATTERNS = listOf(
+        "close app", "close", "fermer l'application", "fermer", "ok",
+    )
+
+    /** Max length of an ANR / crash caption ("MyLongAppName isn't responding"). */
+    private const val STOP_CAPTION_MAX_LEN = 80
+
+    /** A detected system ANR / crash dialog and the button that resolves it. */
+    data class AppStopDialog(val isAnr: Boolean, val caption: String, val dismissNode: UiNode?)
+
+    /**
+     * Detects the system "app isn't responding" / "app has stopped" dialog
+     * anywhere in [root]. The dialog is a small window over the app, so the
+     * dominant package usually still reads as the app itself — detection must
+     * scan captions, not packages. For an ANR the preferred button is "Wait"
+     * (the app may still come back); for a crash it is the close affordance.
+     */
+    fun detectAppStopDialog(root: UiNode): AppStopDialog? {
+        var anr = false
+        var crash = false
+        var caption = ""
+        root.walk { n ->
+            val raw = n.text.ifBlank { n.contentDesc }.trim()
+            if (raw.isEmpty() || raw.length > STOP_CAPTION_MAX_LEN) return@walk
+            val low = raw.lowercase()
+            if (!anr && ANR_PHRASES.any { low.contains(it) }) { anr = true; caption = raw }
+            if (!crash && !anr && CRASH_PHRASES.any { low.contains(it) }) { crash = true; caption = raw }
+        }
+        if (!anr && !crash) return null
+        val buttons = ArrayList<UiNode>()
+        root.walk { n ->
+            if (!n.clickable || !n.enabled) return@walk
+            val b = n.bounds ?: return@walk
+            if (b.width <= 0 || b.height <= 0) return@walk
+            buttons += n
+        }
+        fun firstMatching(patterns: List<String>): UiNode? {
+            for (p in patterns) {
+                val hit = buttons.firstOrNull { matchesPattern((it.text + " " + it.contentDesc).lowercase(), p) }
+                if (hit != null) return hit
+            }
+            return null
+        }
+        val dismiss = if (anr) {
+            firstMatching(ANR_WAIT_PATTERNS) ?: firstMatching(STOP_CLOSE_PATTERNS)
+        } else {
+            firstMatching(STOP_CLOSE_PATTERNS)
+        }
+        return AppStopDialog(isAnr = anr, caption = caption, dismissNode = dismiss)
+    }
+
+    // -- Destructive / consent heuristics --------------------------------------
+
+    /**
+     * Labels that mark an action as *destructive or irreversible*: it destroys
+     * the session context (logout), user data (delete / reset), money
+     * (buy / subscribe) or fires a real-world side effect (placing a call,
+     * sending a message). Matched with word boundaries so "call" can't fire
+     * inside "recall" or "delete" inside "undeleted".
+     */
+    private val DESTRUCTIVE_PATTERNS = listOf(
+        // Session killers
+        "log out", "logout", "sign out", "déconnexion", "se déconnecter", "deconnexion",
+        // Data destruction
+        "delete", "supprimer", "remove account", "erase", "effacer",
+        "reset", "réinitialiser", "reinitialiser", "clear data", "uninstall", "désinstaller",
+        "format",
+        // Money
+        "buy", "purchase", "acheter", "payer", "pay now", "subscribe", "s'abonner",
+        "checkout", "commander",
+        // Real-world side effects
+        "call", "appeler", "send sms", "envoyer un sms", "emergency", "urgence",
+    )
+
+    private fun hasWordBoundaryMatch(haystack: String, patterns: List<String>): Boolean {
+        if (haystack.isBlank()) return false
+        return patterns.any { p ->
+            Regex("(^|[^\\p{L}])${Regex.escape(p)}($|[^\\p{L}])").containsMatchIn(haystack)
+        }
+    }
+
+    /**
+     * Heuristic: tapping this clickable likely destroys something (session,
+     * data, money) or triggers a real-world side effect. The explorer applies
+     * [com.salaun.tristan.uiautomator.explorer.DestructivePolicy] to these.
+     */
+    fun isLikelyDestructive(c: ClickableRef): Boolean {
+        val idToken = c.resourceId.substringAfterLast('/').replace('_', ' ').lowercase()
+        val haystack = (c.text + " " + c.contentDesc).lowercase()
+        return hasWordBoundaryMatch(haystack, DESTRUCTIVE_PATTERNS) ||
+            hasWordBoundaryMatch(idToken, DESTRUCTIVE_PATTERNS)
+    }
+
+    /**
+     * Labels of an *unlocking* affordance: a cookie / GDPR consent accept, a
+     * "Get started", an "I agree". Exercising these FIRST clears the banner /
+     * gate so the rest of the screen (often dimmed or blocked behind the
+     * overlay) becomes actionable — the mirror image of dismiss-last.
+     */
+    private val CONSENT_ACCEPT_PATTERNS = listOf(
+        "accept all", "tout accepter", "accept", "accepter", "j'accepte",
+        "i agree", "agree", "got it", "compris", "continue", "continuer",
+        "get started", "commencer", "start", "démarrer", "demarrer",
+    )
+
+    fun isLikelyConsentAccept(c: ClickableRef): Boolean {
+        val haystack = (c.text + " " + c.contentDesc).lowercase()
+        return hasWordBoundaryMatch(haystack, CONSENT_ACCEPT_PATTERNS)
     }
 
     /**
@@ -388,37 +632,46 @@ object StateOps {
         val seen = HashSet<String>()
         val candidates = ArrayList<Candidate>()
         root.walk { n ->
-            if (!n.clickable || !n.enabled) return@walk
+            if (!n.enabled) return@walk
+            if (!n.clickable && !n.longClickable) return@walk
             val b = n.bounds ?: return@walk
             if (b.width <= 0 || b.height <= 0) return@walk
             if (pkgFilter.isNotBlank() && n.packageName.isNotBlank() && n.packageName != pkgFilter) return@walk
-            val key = "${n.className}|${n.resourceId}|${b.left},${b.top},${b.right},${b.bottom}"
-            if (!seen.add(key)) return@walk
-            candidates += Candidate(
-                node = n,
-                ref = ClickableRef(
-                    resourceId = n.resourceId,
-                    className = n.className,
-                    text = n.text,
-                    contentDesc = n.contentDesc,
-                    bounds = SerialBounds.from(b),
-                    tapX = (b.left + b.right) / 2,
-                    tapY = (b.top + b.bottom) / 2,
-                    insideWheelPicker = isInsideWheelPicker(n),
-                ),
+            fun ref(gesture: String) = ClickableRef(
+                resourceId = n.resourceId,
+                className = n.className,
+                text = n.text,
+                contentDesc = n.contentDesc,
+                bounds = SerialBounds.from(b),
+                tapX = (b.left + b.right) / 2,
+                tapY = (b.top + b.bottom) / 2,
+                insideWheelPicker = isInsideWheelPicker(n),
+                gesture = gesture,
             )
+            // A node may produce up to two candidates: a tap (clickable) and a
+            // long-press (long-clickable, which opens context menus a tap never
+            // reaches). Each carries its own gesture so they are exercised —
+            // and recorded — independently.
+            if (n.clickable) {
+                val key = "${n.className}|${n.resourceId}|${b.left},${b.top},${b.right},${b.bottom}|tap"
+                if (seen.add(key)) candidates += Candidate(n, ref(ClickableRef.GESTURE_TAP))
+            }
+            if (n.longClickable) {
+                val key = "${n.className}|${n.resourceId}|${b.left},${b.top},${b.right},${b.bottom}|long"
+                if (seen.add(key)) candidates += Candidate(n, ref(ClickableRef.GESTURE_LONG_PRESS))
+            }
         }
 
-        // Group candidates by (parent identity, class, resource-id). We use
-        // an IdentityHashMap-keyed bucket so that two distinct parents that
-        // happen to compare structurally equal stay in their own buckets —
+        // Group candidates by (parent identity, class, resource-id, gesture).
+        // We use an IdentityHashMap-keyed bucket so that two distinct parents
+        // that happen to compare structurally equal stay in their own buckets —
         // sibling-ness is a relationship in the actual DOM, not a value
         // equality check.
         val groups = LinkedHashMap<String, MutableList<Candidate>>()
         val parentIds = java.util.IdentityHashMap<UiNode, Int>()
         for (c in candidates) {
             val parentId = c.node.parent?.let { p -> parentIds.getOrPut(p) { parentIds.size } } ?: -1
-            val gk = "$parentId|${c.node.className}|${c.node.resourceId}"
+            val gk = "$parentId|${c.node.className}|${c.node.resourceId}|${c.ref.gesture}"
             groups.getOrPut(gk) { mutableListOf() } += c
         }
 
@@ -429,6 +682,39 @@ object StateOps {
             for (c in kept) out += c.ref.copy(siblingGroupSize = total)
         }
         return if (out.size > max) out.subList(0, max).toList() else out
+    }
+
+    /**
+     * Horizontal pagers / carousels on the screen: scrollable containers that
+     * are markedly wider than tall (or whose class names them a pager). Their
+     * content advances with a horizontal swipe, which is the ONLY way to walk
+     * a swipe-only onboarding (no Next button) or to reveal carousel cards.
+     * Wheel pickers are excluded — "scrolling" them only rotates labels.
+     * Nested pagers are collapsed to the outermost one.
+     */
+    fun findHorizontalPagers(root: UiNode): List<UiNode> {
+        val pagers = ArrayList<UiNode>()
+        root.walk { n ->
+            if (!n.scrollable || !n.enabled) return@walk
+            if (isInsideWheelPicker(n)) return@walk
+            val b = n.bounds ?: return@walk
+            if (b.width < 300) return@walk
+            val classHit = n.className.contains("ViewPager") ||
+                n.className.contains("HorizontalScrollView") ||
+                n.className.contains("Pager")
+            val shapeHit = b.width > b.height && b.height in 1..(b.width)
+            if (!classHit && !(shapeHit && b.height < 900)) return@walk
+            pagers += n
+        }
+        // Drop pagers nested inside another collected pager.
+        return pagers.filter { p ->
+            var anc = p.parent
+            while (anc != null) {
+                if (anc in pagers) return@filter false
+                anc = anc.parent
+            }
+            true
+        }
     }
 
     /**

@@ -1,7 +1,10 @@
 package com.salaun.tristan.uiautomator.ui
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpSize
@@ -84,6 +88,12 @@ private fun ScreenshotDetailContent(
     val pngBytes = remember(stateEntry.id, stateEntry.screenshotPath) {
         store.readScreenshot(stateEntry.screenshotPath)
     }
+    // Stitched full-scroll capture (when the explorer recorded one): decoded
+    // once per state, shown in place of the plain screenshot when the user
+    // wants to validate the screen's entire scrolled content.
+    val scrollBitmap = remember(stateEntry.id, stateEntry.scrollScreenshotPath) {
+        stateEntry.scrollScreenshotPath?.let { loadThumbnail(store, it) }
+    }
     val xmlText = remember(stateEntry.id, stateEntry.xmlPath) {
         store.readXml(stateEntry.xmlPath)
     }
@@ -98,6 +108,9 @@ private fun ScreenshotDetailContent(
     var selectedNode: UiNode? by remember(stateEntry.id) { mutableStateOf(null) }
     var clickedClickable: ClickableRef? by remember(stateEntry.id) { mutableStateOf(null) }
     var showClickables by remember(stateEntry.id) { mutableStateOf(true) }
+    // Defaults to the full scrolled view when one exists — that is what the
+    // window is opened for; uncheck to return to the interactive capture.
+    var showFullScroll by remember(stateEntry.id, scrollBitmap) { mutableStateOf(scrollBitmap != null) }
 
     val outgoing: List<TransitionEntry> = remember(session, stateEntry.id) {
         session.transitions.filter { it.from == stateEntry.id }
@@ -166,6 +179,12 @@ private fun ScreenshotDetailContent(
                 style = MaterialTheme.typography.bodySmall,
             )
             Box(Modifier.weight(1f))
+            if (scrollBitmap != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = showFullScroll, onCheckedChange = { showFullScroll = it })
+                    Text(strings.detailShowFullScroll, style = MaterialTheme.typography.bodySmall)
+                }
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = showClickables, onCheckedChange = { showClickables = it })
                 Text(strings.detailShowClickables, style = MaterialTheme.typography.bodySmall)
@@ -175,21 +194,42 @@ private fun ScreenshotDetailContent(
 
         Row(modifier = Modifier.fillMaxSize()) {
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                ScreenshotPanel(
-                    pngBytes = pngBytes,
-                    rootNode = rootNode,
-                    selectedNode = selectedNode,
-                    // Hovering reveals the ancestor chain so the XML tree is
-                    // expanded and highlighted in sync, exactly like the main
-                    // capture screen.
-                    onNodeHovered = { selectAndReveal(it) },
-                    onNodeClicked = { node ->
-                        selectAndReveal(node)
-                        clickedClickable = clickableFor(node)
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                    clickableBounds = if (showClickables) clickableBounds else emptyList(),
-                )
+                if (showFullScroll && scrollBitmap != null) {
+                    // Full stitched scroll: the whole screen content in one
+                    // tall image, scrollable vertically. Pure visual
+                    // validation — hover / click hit-testing only applies to
+                    // the plain capture view.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            .padding(8.dp),
+                        contentAlignment = Alignment.TopCenter,
+                    ) {
+                        Image(
+                            bitmap = scrollBitmap,
+                            contentDescription = stateEntry.id,
+                            contentScale = ContentScale.FillWidth,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                } else {
+                    ScreenshotPanel(
+                        pngBytes = pngBytes,
+                        rootNode = rootNode,
+                        selectedNode = selectedNode,
+                        // Hovering reveals the ancestor chain so the XML tree is
+                        // expanded and highlighted in sync, exactly like the main
+                        // capture screen.
+                        onNodeHovered = { selectAndReveal(it) },
+                        onNodeClicked = { node ->
+                            selectAndReveal(node)
+                            clickedClickable = clickableFor(node)
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        clickableBounds = if (showClickables) clickableBounds else emptyList(),
+                    )
+                }
             }
             VerticalDivider(modifier = Modifier.fillMaxHeight())
             Column(modifier = Modifier.width(440.dp).fillMaxHeight()) {
