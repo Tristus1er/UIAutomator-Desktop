@@ -30,4 +30,28 @@ in your IDE’s toolbar or run it directly from the terminal:
 
 ---
 
+### Build native installers
+
+`jpackage` (used by Compose Desktop) only builds an installer for the OS it
+runs on. To build for the current OS:
+
+```shell
+./gradlew :composeApp:packageDistributionForCurrentOS
+```
+
+Output lands in `composeApp/build/compose/binaries/main/<format>/`:
+`.msi` on Windows, `.dmg` on macOS, `.deb` on Linux.
+
+**All three platforms at once** are produced by the GitHub Actions workflow
+[.github/workflows/release.yml](.github/workflows/release.yml), which runs the
+build on a Windows / macOS / Linux runner matrix:
+
+- **Tag a release** — push a tag like `v1.2.3`; the workflow builds the three
+  installers (version taken from the tag) and attaches them to a GitHub
+  Release.
+- **Ad-hoc build** — trigger the workflow manually (`Run workflow`); the
+  installers are uploaded as downloadable run artifacts.
+
+---
+
 Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
