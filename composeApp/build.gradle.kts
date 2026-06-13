@@ -48,8 +48,12 @@ compose.desktop {
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
-            packageName = "com.salaun.tristan.uiautomator"
-            packageVersion = "1.0.0"
+            packageName = "UIAutomator-Desktop"
+            // Version follows the Git tag in CI (passed as -PappVersion=1.2.3,
+            // the "v" prefix stripped by the workflow). jpackage requires a
+            // strict MAJOR.MINOR.PATCH with no leading zeros / suffix, so the
+            // default stays a plain triple for local builds.
+            packageVersion = (project.findProperty("appVersion") as String?)?.takeIf { it.isNotBlank() } ?: "1.0.0"
         }
     }
 }
