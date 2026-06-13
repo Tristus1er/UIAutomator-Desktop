@@ -29,22 +29,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Non-release tasks on purpose: the *release* variant runs ProGuard,
-          # which can rename/strip the kotlinx.serialization classes this app
-          # relies on for sessions and rules — a build that passes but crashes
-          # at runtime. These installers are larger but always correct.
+          # Release tasks: ProGuard-shrunk/optimized installers. The keep rules
+          # in composeApp/compose-desktop.pro preserve the kotlinx.serialization
+          # serializers (sessions, layout, rules) and the coroutines Swing main
+          # dispatcher, so the optimized build behaves like the dev build.
           - os: windows-latest
             name: Windows (msi)
-            task: packageMsi
-            artifact_glob: composeApp/build/compose/binaries/main/msi/*.msi
+            task: packageReleaseMsi
+            artifact_glob: composeApp/build/compose/binaries/main-release/msi/*.msi
           - os: macos-latest
             name: macOS (dmg)
-            task: packageDmg
-            artifact_glob: composeApp/build/compose/binaries/main/dmg/*.dmg
+            task: packageReleaseDmg
+            artifact_glob: composeApp/build/compose/binaries/main-release/dmg/*.dmg
           - os: ubuntu-latest
             name: Linux (deb)
-            task: packageDeb
-            artifact_glob: composeApp/build/compose/binaries/main/deb/*.deb
+            task: packageReleaseDeb
+            artifact_glob: composeApp/build/compose/binaries/main-release/deb/*.deb
 
     steps:
       - uses: actions/checkout@v4

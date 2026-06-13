@@ -46,6 +46,19 @@ compose.desktop {
     application {
         mainClass = "com.salaun.tristan.uiautomator.MainKt"
 
+        // The release build runs ProGuard (shrink + optimize). Without keep
+        // rules it strips the reflectively-reached kotlinx.serialization
+        // serializers and the coroutines Swing main dispatcher, producing an
+        // installer that builds fine but crashes at runtime. Obfuscation stays
+        // off: it adds renaming risk for no real benefit on a desktop app, and
+        // a non-obfuscated stack trace is worth far more when diagnosing a
+        // field report. See compose-desktop.pro for the rationale.
+        buildTypes.release.proguard {
+            obfuscate.set(false)
+            optimize.set(true)
+            configurationFiles.from(project.file("compose-desktop.pro"))
+        }
+
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "UIAutomator-Desktop"
