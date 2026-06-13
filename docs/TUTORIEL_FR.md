@@ -181,13 +181,22 @@ transitions.
 | **Actions par état** | Nombre maximal d'éléments exercés par écran. |
 | **Délai d'attente (ms)** | Temps de stabilisation après chaque geste, en plus de la détection d'inactivité de l'écran. |
 
-**Démarrer** lance l'exploration ; **Arrêter** l'interrompt proprement (la
-session partielle est sauvegardée sur disque et reste exploitable).
+La section **Appareils** liste les téléphones connectés avec une case à
+cocher chacun : cochez-en **plusieurs pour lancer l'exploration sur chacun en
+parallèle**. Chaque appareil obtient sa propre session (le dossier est suffixé
+du numéro de série) — idéal pour comparer ensuite le comportement de la même
+app sur plusieurs téléphones, côte à côte, via les exports HTML ou l'écran
+*Sessions*. Sans case cochée, l'exploration part sur l'appareil sélectionné
+dans la barre d'outils, comme avant.
 
-Pendant l'exploration : barre de progression (`Découverts: X | Traités: Y/Z`,
-état courant, action courante), logs détaillés avec **Auto-scroll** et
-**Copier les logs**, puis panneau de synthèse (états, transitions, dossier de
-la session).
+**Démarrer** lance l'exploration ; **Arrêter** interrompt proprement toutes
+les exécutions en cours (les sessions partielles sont sauvegardées sur disque
+et restent exploitables).
+
+Pendant l'exploration, **un panneau de suivi par appareil** s'affiche côte à
+côte : nom de l'appareil, barre de progression (`Découverts: X | Traités:
+Y/Z`, état courant, action courante), compteurs d'états/transitions, dossier
+de la session, et logs détaillés avec **Auto-scroll** et **Copier les logs**.
 
 ### 4.2 Ce que l'explorateur sait gérer tout seul
 

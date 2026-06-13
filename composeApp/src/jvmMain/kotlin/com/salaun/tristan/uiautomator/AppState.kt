@@ -42,6 +42,28 @@ import kotlinx.coroutines.withContext
 
 enum class Screen { Main, Settings, Explorer, ManualExplorer, Graph, Sessions, Rules, RulePackage, RuleEdit }
 
+/**
+ * One automatic-exploration run bound to one device. Several runs can live
+ * side by side (parallel exploration on multiple phones); each has its own
+ * session store, log, progress and lifecycle, so the UI can show them in
+ * independent panels and the resulting sessions can be compared afterwards.
+ */
+class ExplorationRun(
+    val serial: String?,
+    val deviceLabel: String,
+) {
+    val log: SnapshotStateList<String> = mutableStateListOf()
+    var progress: ExplorerProgress? by mutableStateOf(null)
+
+    // Same neverEqualPolicy rationale as AppState.explorerSession: the
+    // Explorer mutates the session's lists in place and re-publishes the same
+    // instance, so structural equality would never trigger recomposition.
+    var session: ExplorationSession? by mutableStateOf(null, neverEqualPolicy())
+    var store: SessionStore? = null
+    var running: Boolean by mutableStateOf(false)
+    internal var job: Job? = null
+}
+
 class AppState(
     val settings: AppSettings,
     val scope: CoroutineScope,
@@ -93,10 +115,18 @@ class AppState(
     var explorerConfig: ExplorationConfig by mutableStateOf(
         loadExplorationConfig(settings)
     )
-    var explorerRunning: Boolean by mutableStateOf(false)
-    private var explorerJob: Job? = null
-    val explorerLog: SnapshotStateList<String> = mutableStateListOf()
-    var explorerProgress: ExplorerProgress? by mutableStateOf(null)
+    /**
+     * The active exploration runs — one per device when several phones are
+     * checked on the Explorer screen, a single entry otherwise. The list is
+     * replaced at every start; finished runs stay visible until the next start
+     * so their logs and summaries can still be read.
+     */
+    val explorerRuns: SnapshotStateList<ExplorationRun> = mutableStateListOf()
+
+    /** Serials checked on the Explorer screen for the next (parallel) start. */
+    val explorerSelectedSerials: SnapshotStateList<String> = mutableStateListOf()
+
+    val explorerRunning: Boolean get() = explorerRuns.any { it.running }
     // `neverEqualPolicy` is critical: ExplorationSession is a data class
     // backed by mutable lists. The Explorer mutates `session.states` /
     // `session.transitions` in place and re-assigns the SAME instance via
@@ -406,22 +436,56 @@ class AppState(
         persistExplorationConfig(settings, explorerConfig)
     }
 
+    /** Adds/removes [serial] from the Explorer screen's parallel-run selection. */
+    fun toggleExplorerDevice(serial: String, checked: Boolean) {
+        if (checked) {
+            if (serial !in explorerSelectedSerials) explorerSelectedSerials += serial
+        } else {
+            explorerSelectedSerials.remove(serial)
+        }
+    }
+
+    /**
+     * Starts the automatic exploration on every device checked on the
+     * Explorer screen — one independent run (and one session) per device, all
+     * in parallel. With no checkbox ticked it falls back to the toolbar's
+     * selected device, preserving the historical single-device behaviour.
+     */
     fun startExploration() {
         if (explorerRunning) return
         if (adbPath.isBlank()) { errorMessage = strings.explorerErrorAdbMissing; return }
         val pkg = explorerConfig.targetPackage.trim()
         if (pkg.isBlank()) { errorMessage = strings.explorerErrorNoPackage; return }
-        val serial = selectedSerial
-        val store = SessionStore.create(SessionStore.defaultRoot(), pkg)
-        val explorer = Explorer(adb, serial, explorerConfig, store, RuleEngine(ruleStore))
-        explorerLog.clear()
-        explorerProgress = null
-        explorerSession = null
-        explorerStore = store
-        errorMessage = null
-        explorerRunning = true
+        val serials: List<String?> = explorerSelectedSerials
+            .filter { s -> devices.any { it.serial == s } }
+            .distinct()
+            .ifEmpty { listOf(selectedSerial) }
 
-        explorerJob = scope.launch {
+        explorerRuns.clear()
+        explorerSession = null
+        explorerStore = null
+        errorMessage = null
+        // Tag the session folder with the device serial only for parallel
+        // starts: single-device sessions keep their historical naming.
+        val tagWithSerial = serials.size > 1
+        for (serial in serials) startExplorationRun(pkg, serial, tagWithSerial)
+    }
+
+    private fun startExplorationRun(pkg: String, serial: String?, tagWithSerial: Boolean) {
+        val deviceLabel = devices.firstOrNull { it.serial == serial }?.displayName
+            ?: serial
+            ?: strings.toolbarNoDevice
+        val store = SessionStore.create(
+            rootDir = SessionStore.defaultRoot(),
+            targetPackage = pkg,
+            suffix = if (tagWithSerial) serial else null,
+        )
+        val run = ExplorationRun(serial = serial, deviceLabel = deviceLabel)
+        run.store = store
+        run.running = true
+        explorerRuns += run
+
+        run.job = scope.launch {
             try {
                 // Listener callbacks run on whichever dispatcher `explorer.run`
                 // is currently on — i.e. Dispatchers.IO. Mutating Compose
@@ -434,35 +498,41 @@ class AppState(
                 val listener = object : Explorer.Listener {
                     override fun onLog(msg: String) {
                         mainScope.launch(Dispatchers.Main.immediate) {
-                            explorerLog += msg
-                            if (explorerLog.size > 500) explorerLog.removeAt(0)
+                            run.log += msg
+                            if (run.log.size > 500) run.log.removeAt(0)
                         }
                     }
                     override fun onProgress(progress: ExplorerProgress) {
                         mainScope.launch(Dispatchers.Main.immediate) {
-                            explorerProgress = progress
+                            run.progress = progress
                         }
                     }
                     override fun onSessionUpdated(session: ExplorationSession) {
                         mainScope.launch(Dispatchers.Main.immediate) {
-                            explorerSession = session
+                            run.session = session
                         }
                     }
                 }
+                val explorer = Explorer(adb, serial, explorerConfig, store, RuleEngine(ruleStore))
                 val session = withContext(Dispatchers.IO) { explorer.run(listener) }
+                run.session = session
+                // The Graph screen shows one session at a time: anchor it on
+                // the most recently completed run. The other runs' sessions
+                // are reachable from the Sessions screen for comparison.
                 explorerSession = session
+                explorerStore = store
             } catch (_: CancellationException) {
-                explorerLog += strings.explorerCancelled
+                run.log += strings.explorerCancelled
             } catch (e: Exception) {
                 errorMessage = strings.explorerErrorFmt.format(e.message ?: e::class.simpleName.orEmpty())
             } finally {
-                explorerRunning = false
+                run.running = false
             }
         }
     }
 
     fun stopExploration() {
-        explorerJob?.cancel()
+        explorerRuns.forEach { it.job?.cancel() }
     }
 
     // --- Manual exploration --------------------------------------------------

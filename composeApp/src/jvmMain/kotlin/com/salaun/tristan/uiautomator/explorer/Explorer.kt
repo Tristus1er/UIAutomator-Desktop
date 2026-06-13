@@ -4,9 +4,11 @@ import com.salaun.tristan.uiautomator.adb.AdbGateway
 import com.salaun.tristan.uiautomator.model.DumpParser
 import com.salaun.tristan.uiautomator.model.UiNode
 import com.salaun.tristan.uiautomator.rules.ElementBehavior
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -250,7 +252,7 @@ class Explorer(
             // captured as its own state and the auto-grant linked to the
             // screen behind it once the root is registered below.
             var launchGrant: GrantOutcome? = null
-            if (StateOps.isPermissionGatePackage(initial.pkg)) {
+            if (StateOps.isPermissionGateScreen(initial.pkg, initial.activity)) {
                 listener.onLog("⚠ Permission dialog on launch — auto-granting…")
                 launchGrant = grantPermissionChain(
                     first = initial, incomingFrom = null, incomingAction = null, triggerPath = emptyList(),
@@ -305,15 +307,28 @@ class Explorer(
             listener.onLog("Exploration done: ${session.states.size} states, ${session.transitions.size} transitions.")
             return session
         } finally {
-            // Flush whatever was recorded, even on cancellation — a partially
-            // explored session on disk is what `resume()` picks back up.
-            runCatching { persist(force = true) }
-            // Always restore the live status bar, even on cancellation/exception,
-            // otherwise the user is stuck with a frozen clock until they reboot.
-            if (demoOn) {
-                runCatching { adb.exitDemoMode(serial) }
-                listener.onLog("✓ SystemUI demo mode disabled")
-            }
+            finishExploration(demoOn)
+        }
+    }
+
+    /**
+     * End-of-run cleanup, shared by [run] and [resume]. Runs inside
+     * [NonCancellable] because the common exit path is the user pressing Stop,
+     * which cancels the coroutine: a plain `suspend` ADB call in a cancelled
+     * scope throws [kotlinx.coroutines.CancellationException] on entry to its
+     * `withContext`, so `exitDemoMode` would silently never run and the device
+     * would stay stuck with a frozen status bar. NonCancellable lets these
+     * final ADB commands complete even on cancellation.
+     */
+    private suspend fun finishExploration(demoOn: Boolean) = withContext(NonCancellable) {
+        // Flush whatever was recorded, even on cancellation — a partially
+        // explored session on disk is what `resume()` picks back up.
+        runCatching { persist(force = true) }
+        // Always restore the live status bar, even on cancellation/exception,
+        // otherwise the user is stuck with a frozen clock until they reboot.
+        if (demoOn) {
+            runCatching { adb.exitDemoMode(serial) }
+            listener.onLog("✓ SystemUI demo mode disabled")
         }
     }
 
@@ -456,11 +471,7 @@ class Explorer(
             listener.onLog("Exploration done: ${session.states.size} states, ${session.transitions.size} transitions.")
             return session
         } finally {
-            runCatching { persist(force = true) }
-            if (demoOn) {
-                runCatching { adb.exitDemoMode(serial) }
-                listener.onLog("✓ SystemUI demo mode disabled")
-            }
+            finishExploration(demoOn)
         }
     }
 
@@ -1381,8 +1392,10 @@ class Explorer(
      */
     private suspend fun classifyLanding(source: StateEntry, click: ClickableRef, after: Snapshot): StateEntry? {
         // System permission dialog: capture + auto-grant; continue on the
-        // screen behind the gate.
-        if (StateOps.isPermissionGatePackage(after.pkg)) {
+        // screen behind the gate. The activity-aware check also catches OEM
+        // permission helpers (ColorOS Bluetooth/location enable dialogs) that
+        // live outside the standard permission packages.
+        if (StateOps.isPermissionGateScreen(after.pkg, after.activity)) {
             val grant = grantPermissionChain(after, source, click, source.pathFromRoot + click)
             countProcessed(source.id, click.label); persist()
             if (grant == null) {
@@ -1539,7 +1552,7 @@ class Explorer(
         repeat(PERMISSION_FLOW_MAX_STEPS) {
             when {
                 // The screen behind the gate has been reached — done.
-                !StateOps.isPermissionGatePackage(current.pkg) &&
+                !StateOps.isPermissionGateScreen(current.pkg, current.activity) &&
                     current.pkg !in StateOps.PERMISSION_SETTINGS_PACKAGES -> {
                     val did = prevDialogId
                     val act = prevAllow
@@ -1583,11 +1596,13 @@ class Explorer(
                     }
                     persist()
 
-                    // GMS / Bluetooth gate dialogs don't carry a literal
-                    // "Allow"; widen to the generic positive affordances there.
+                    // Non-standard gate dialogs (GMS, OEM Bluetooth/location
+                    // enable helpers) may not carry a literal "Allow"; widen to
+                    // the generic positive affordances for anything outside the
+                    // canonical permission packages.
                     val node = StateOps.findPermissionAllowNode(
                         current.root,
-                        includeGatePositives = current.pkg in StateOps.SYSTEM_GATE_PACKAGES,
+                        includeGatePositives = current.pkg !in StateOps.PERMISSION_PACKAGES,
                     )
                     if (node == null) {
                         listener.onLog("  ⚠ no Allow button on permission dialog ${dialog.id}")
@@ -1922,10 +1937,10 @@ class Explorer(
             // "Only this time" grant re-asking) must be auto-allowed rather
             // than mistaken for the screen we're waiting for — tap through it
             // quietly (it was already captured on the first pass) and retry.
-            if (snap != null && StateOps.isPermissionGatePackage(snap.pkg)) {
+            if (snap != null && StateOps.isPermissionGateScreen(snap.pkg, snap.activity)) {
                 val node = StateOps.findPermissionAllowNode(
                     snap.root,
-                    includeGatePositives = snap.pkg in StateOps.SYSTEM_GATE_PACKAGES,
+                    includeGatePositives = snap.pkg !in StateOps.PERMISSION_PACKAGES,
                 )
                 val b = node?.bounds
                 if (b != null) {

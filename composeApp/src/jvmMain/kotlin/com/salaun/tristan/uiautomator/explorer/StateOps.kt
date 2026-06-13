@@ -55,6 +55,37 @@ object StateOps {
         pkg in PERMISSION_PACKAGES || pkg in SYSTEM_GATE_PACKAGES
 
     /**
+     * Activity class-name fragments that identify an OEM permission / enable
+     * confirmation dialog hosted *outside* the standard permission packages.
+     * OPPO / OnePlus (ColorOS) routes "allow this app to turn on Bluetooth"
+     * through `com.oplus.wirelesssettings/…RequestPermissionHelperActivity`
+     * — a permission gate by every other measure (a small Allow/Deny dialog)
+     * that package-only matching misses, stranding the explorer on what looks
+     * like a foreign Settings screen. Matched case-insensitively on the
+     * Activity's simple class name.
+     */
+    private val PERMISSION_GATE_ACTIVITY_FRAGMENTS = listOf(
+        "RequestPermissionHelperActivity",
+        "RequestPermissionActivity",
+        "GrantPermissionsActivity",
+        "ConfirmConnectActivity",
+        "BluetoothPermissionActivity",
+    )
+
+    /**
+     * `true` when the screen is a permission / enable gate — either by package
+     * ([isPermissionGatePackage]) or by its foreground Activity being a known
+     * OEM permission-helper ([PERMISSION_GATE_ACTIVITY_FRAGMENTS]). [activity]
+     * is the `pkg/cls` component from `dumpsys`, or `null` when unavailable
+     * (in which case only the package signal is used).
+     */
+    fun isPermissionGateScreen(pkg: String, activity: String?): Boolean {
+        if (isPermissionGatePackage(pkg)) return true
+        val cls = activity?.substringAfterLast('/') ?: return false
+        return PERMISSION_GATE_ACTIVITY_FRAGMENTS.any { cls.contains(it, ignoreCase = true) }
+    }
+
+    /**
      * Home-screen launchers. Landing on one of these after a tap means the
      * app went away under us (a crash, a finish(), an exit menu) — there is
      * nothing to capture or explore there, the only sane move is to relaunch

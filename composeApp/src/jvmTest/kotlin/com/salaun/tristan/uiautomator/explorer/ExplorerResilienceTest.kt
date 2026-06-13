@@ -421,6 +421,61 @@ class ExplorerResilienceTest {
         )
     }
 
+    @Test
+    fun `an OEM permission helper outside the standard packages is auto-granted via its activity`() {
+        // ColorOS / OPPO routes "allow this app to turn on Bluetooth" through
+        // com.oplus.wirelesssettings/…RequestPermissionHelperActivity — a small
+        // Allow/Deny dialog that package-only matching treats as a foreign
+        // Settings screen, stranding the explorer mid-onboarding. The
+        // activity-aware gate detection must recognise and auto-grant it.
+        val oplusDialogXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" package="com.oplus.wirelesssettings" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node class="android.widget.TextView" text="Allow STid to turn on Bluetooth?" package="com.oplus.wirelesssettings" clickable="false" enabled="true" bounds="[60,900][1020,1050]"/>
+    <node class="android.widget.Button" text="Refuser" resource-id="android:id/button2" package="com.oplus.wirelesssettings" clickable="true" enabled="true" bounds="[120,1300][520,1400]"/>
+    <node class="android.widget.Button" text="Autoriser" resource-id="android:id/button3" package="com.oplus.wirelesssettings" clickable="true" enabled="true" bounds="[560,1300][960,1400]"/>
+  </node>
+</hierarchy>"""
+        val gw = object : AdbGateway {
+            var screen = "home"
+            override suspend fun launchApp(serial: String?, pkg: String) { screen = "home" }
+            override suspend fun pressBack(serial: String?) {}
+            override suspend fun inputTap(serial: String?, x: Int, y: Int) {
+                when (screen) {
+                    "home" -> if (y < 150) screen = "oplus_gate"
+                    "oplus_gate" -> if (x in 560..960 && y in 1300..1400) screen = "behind" // Autoriser
+                }
+            }
+            override suspend fun inputSwipe(serial: String?, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int) {}
+            override suspend fun screenshotPng(serial: String?): ByteArray = byteArrayOf(1)
+            override suspend fun currentFocusedActivity(serial: String?): String? = when (screen) {
+                "oplus_gate" -> "com.oplus.wirelesssettings/com.android.settings.bluetooth.RequestPermissionHelperActivity"
+                else -> "com.example.app/com.example.app.MainActivity"
+            }
+            override suspend fun dumpUiXml(serial: String?): String = when (screen) {
+                "home" -> screen("home", listOf(Btn("enable_bt", 100, 100)))
+                "oplus_gate" -> oplusDialogXml
+                else -> screen("behind")
+            }
+        }
+
+        val session = runExplorer(gw)
+
+        // The OEM gate is captured as a one-time dialog state…
+        val gate = session.states.single { it.packageName == "com.oplus.wirelesssettings" }
+        assertTrue(gate.clickables.isEmpty(), "the OEM permission gate is terminal, like any permission dialog")
+        // …auto-granted (Autoriser tapped, never Refuser)…
+        assertTrue(
+            session.transitions.none { it.leftApp },
+            "the OEM gate must be granted, not recorded as leftApp",
+        )
+        val grant = session.transitions.single { it.from == gate.id && !it.loop }
+        assertEquals("Autoriser", grant.action.text)
+        // …and the screen behind it is reached and explored.
+        val behind = session.states.single { it.id == grant.to }
+        assertEquals("com.example.app", behind.packageName)
+    }
+
     // -- Manifest coverage / direct launch ------------------------------------------------
 
     @Test

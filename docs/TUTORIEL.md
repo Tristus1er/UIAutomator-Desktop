@@ -178,12 +178,20 @@ transitions.
 | **Actions per state** | Maximum number of elements exercised per screen. |
 | **Settle delay (ms)** | Stabilisation time after each gesture, on top of the screen-idle detection. |
 
-**Start** launches the exploration; **Stop** interrupts it cleanly (the
-partial session is saved to disk and remains usable).
+The **Devices** section lists the connected phones, each with a checkbox:
+check **several to run the exploration on all of them in parallel**. Each
+device gets its own session (the folder is suffixed with the serial number) —
+ideal for comparing the same app's behaviour across phones, side by side,
+through the HTML exports or the *Sessions* screen. With nothing checked, the
+exploration runs on the toolbar's selected device, as before.
 
-During the exploration: progress bar (`Discovered: X | Processed: Y/Z`,
-current state, current action), detailed logs with **Auto-scroll** and
-**Copy logs**, then a summary panel (states, transitions, session folder).
+**Start** launches the exploration; **Stop** cleanly interrupts every running
+execution (partial sessions are saved to disk and remain usable).
+
+During the exploration, **one monitoring panel per device** is shown side by
+side: device name, progress bar (`Discovered: X | Processed: Y/Z`, current
+state, current action), state/transition counters, session folder, and
+detailed logs with **Auto-scroll** and **Copy logs**.
 
 ### 4.2 What the explorer handles on its own
 

@@ -93,10 +93,26 @@ class SessionStore(val baseDir: File) {
             encodeDefaults = true
         }
 
-        fun create(rootDir: File, targetPackage: String): SessionStore {
+        /**
+         * Creates a fresh timestamped session directory. [suffix] (e.g. a
+         * device serial when several explorations start in parallel) is
+         * sanitised and appended to the folder name; whatever happens, an
+         * existing folder is never reused — two sessions started within the
+         * same second (parallel multi-device runs) each get their own
+         * directory via a numeric de-duplication suffix.
+         */
+        fun create(rootDir: File, targetPackage: String, suffix: String? = null): SessionStore {
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
             val safe = targetPackage.ifBlank { "unknown" }.replace(Regex("[^A-Za-z0-9._-]"), "_")
-            val dir = File(rootDir, "$stamp-$safe")
+            val tag = suffix?.takeIf { it.isNotBlank() }
+                ?.let { "-" + it.replace(Regex("[^A-Za-z0-9._-]"), "_") }
+                .orEmpty()
+            var dir = File(rootDir, "$stamp-$safe$tag")
+            var n = 2
+            while (dir.exists()) {
+                dir = File(rootDir, "$stamp-$safe$tag-$n")
+                n++
+            }
             dir.mkdirs()
             return SessionStore(dir)
         }

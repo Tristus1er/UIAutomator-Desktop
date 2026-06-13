@@ -109,6 +109,8 @@ data class Strings(
     val explorerAutoScroll: String,
     val explorerSummary: String,
     val explorerNoSession: String,
+    val explorerDevicesLabel: String,
+    val explorerDevicesHint: String,
     val explorerPackagePrefix: String,
     val explorerStatesPrefix: String,
     val explorerTransitionsPrefix: String,

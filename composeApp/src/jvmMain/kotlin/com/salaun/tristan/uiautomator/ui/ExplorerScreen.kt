@@ -63,6 +63,8 @@ fun ExplorerScreen(state: AppState) {
 
         ConfigRow(state)
 
+        DevicesRow(state)
+
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(
                 enabled = !state.explorerRunning && state.adbPath.isNotBlank(),
@@ -79,35 +81,118 @@ fun ExplorerScreen(state: AppState) {
             }
         }
 
-        state.explorerProgress?.let { p ->
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                val frac = if (p.plannedActions > 0) p.processedActions.toFloat() / p.plannedActions else 0f
-                LinearProgressIndicator(
-                    progress = { frac.coerceIn(0f, 1f) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                val base = strings.explorerProgressFmt.format(p.discoveredStates, p.processedActions, p.plannedActions)
-                val stateTail = p.currentStateId?.let { " • $it" } ?: ""
-                val actionTail = p.currentActionLabel?.let { " → $it" } ?: ""
-                Text(
-                    base + stateTail + actionTail,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-
         state.errorMessage?.let {
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
 
         HorizontalDivider()
 
-        Row(modifier = Modifier.weight(1f)) {
-            LogPanel(state, modifier = Modifier.weight(1f).fillMaxHeight().padding(end = 8.dp))
-            VerticalDivider(modifier = Modifier.fillMaxHeight())
-            SummaryPanel(state, modifier = Modifier.width(360.dp).fillMaxHeight().padding(start = 8.dp))
+        // One monitoring panel per run, side by side: a single panel for the
+        // classic one-device exploration, N panels when several phones were
+        // checked — each with its own progress, summary and log.
+        val runs = state.explorerRuns.toList()
+        if (runs.isEmpty()) {
+            Text(strings.explorerNoSession, style = MaterialTheme.typography.bodySmall)
+        } else {
+            Row(modifier = Modifier.weight(1f)) {
+                runs.forEachIndexed { index, run ->
+                    if (index > 0) VerticalDivider(modifier = Modifier.fillMaxHeight())
+                    RunPanel(
+                        run = run,
+                        modifier = Modifier.weight(1f).fillMaxHeight().padding(horizontal = 8.dp),
+                    )
+                }
+            }
         }
         }
+    }
+}
+
+/**
+ * Device selection for the next start: every checked device runs its own
+ * exploration in parallel (one session per device). With nothing checked the
+ * exploration falls back to the toolbar's selected device.
+ */
+@Composable
+private fun DevicesRow(state: AppState) {
+    val strings = LocalStrings.current
+    // Pre-select the toolbar device once, so the historical single-device
+    // workflow needs no extra click.
+    LaunchedEffect(Unit) {
+        val current = state.selectedSerial
+        if (state.explorerSelectedSerials.isEmpty() && current != null &&
+            state.devices.any { it.serial == current }
+        ) {
+            state.toggleExplorerDevice(current, true)
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(strings.explorerDevicesLabel, style = MaterialTheme.typography.titleSmall)
+            OutlinedButton(onClick = { state.refreshDevices() }, enabled = !state.busy) {
+                Text(strings.toolbarRefreshDevices)
+            }
+            if (state.devices.isEmpty()) {
+                Text(strings.toolbarNoDevice, style = MaterialTheme.typography.bodySmall)
+            } else {
+                state.devices.forEach { device ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = device.serial in state.explorerSelectedSerials,
+                            onCheckedChange = { state.toggleExplorerDevice(device.serial, it) },
+                            enabled = !state.explorerRunning,
+                        )
+                        Text(device.displayName, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        }
+        Text(
+            strings.explorerDevicesHint,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** Monitoring panel of one exploration run: header, progress, summary, log. */
+@Composable
+private fun RunPanel(run: com.salaun.tristan.uiautomator.ExplorationRun, modifier: Modifier = Modifier) {
+    val strings = LocalStrings.current
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(run.deviceLabel, style = MaterialTheme.typography.titleSmall)
+            if (run.running) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+            }
+        }
+        run.progress?.let { p ->
+            val frac = if (p.plannedActions > 0) p.processedActions.toFloat() / p.plannedActions else 0f
+            LinearProgressIndicator(
+                progress = { frac.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            val base = strings.explorerProgressFmt.format(p.discoveredStates, p.processedActions, p.plannedActions)
+            val stateTail = p.currentStateId?.let { " • $it" } ?: ""
+            val actionTail = p.currentActionLabel?.let { " → $it" } ?: ""
+            Text(base + stateTail + actionTail, style = MaterialTheme.typography.bodySmall)
+        }
+        run.session?.let { session ->
+            Text(
+                "${strings.explorerStatesPrefix}${session.states.size} · " +
+                    "${strings.explorerTransitionsPrefix}${session.transitions.size}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        run.store?.let {
+            Text(
+                it.baseDir.absolutePath,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LogPanel(logs = run.log.toList(), modifier = Modifier.weight(1f).fillMaxWidth())
     }
 }
 
@@ -174,14 +259,13 @@ private fun NumField(label: String, value: String, onType: (String) -> Unit, onC
 }
 
 @Composable
-private fun LogPanel(state: AppState, modifier: Modifier = Modifier) {
+private fun LogPanel(logs: List<String>, modifier: Modifier = Modifier) {
     val strings = LocalStrings.current
-    // Snapshot the live SnapshotStateList into a plain list at every
-    // recomposition: the LazyColumn's measure pass then reads this immutable
-    // copy instead of racing the explorer coroutine that appends new lines.
-    // This sidesteps the "Index 0, size 0" crash observed when the list was
-    // mutated from the IO dispatcher while Compose was measuring.
-    val logs: List<String> = state.explorerLog.toList()
+    // The caller snapshots the live SnapshotStateList into a plain list at
+    // every recomposition: the LazyColumn's measure pass then reads this
+    // immutable copy instead of racing the explorer coroutine that appends
+    // new lines. This sidesteps the "Index 0, size 0" crash observed when the
+    // list was mutated from the IO dispatcher while Compose was measuring.
     val listState = rememberLazyListState()
     // User-controlled toggle: when ON, every new log line pins the viewport to
     // the last entry; when OFF, scroll position is left entirely to the user.
@@ -238,30 +322,6 @@ private fun LogPanel(state: AppState, modifier: Modifier = Modifier) {
                 modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight(),
                 adapter = rememberScrollbarAdapter(listState),
             )
-        }
-    }
-}
-
-@Composable
-private fun SummaryPanel(state: AppState, modifier: Modifier = Modifier) {
-    val strings = LocalStrings.current
-    val session = state.explorerSession
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(strings.explorerSummary, style = MaterialTheme.typography.titleSmall)
-        if (session == null) {
-            Text(strings.explorerNoSession, style = MaterialTheme.typography.bodySmall)
-        } else {
-            Text("${strings.explorerPackagePrefix}${session.targetPackage}", style = MaterialTheme.typography.bodySmall)
-            Text("${strings.explorerStatesPrefix}${session.states.size}", style = MaterialTheme.typography.bodySmall)
-            Text("${strings.explorerTransitionsPrefix}${session.transitions.size}", style = MaterialTheme.typography.bodySmall)
-            state.explorerStore?.let {
-                Text(strings.explorerDirectoryPrefix, style = MaterialTheme.typography.bodySmall)
-                Text(
-                    it.baseDir.absolutePath,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                )
-            }
         }
     }
 }
