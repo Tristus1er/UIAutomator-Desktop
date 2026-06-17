@@ -21,6 +21,14 @@ on:
 permissions:
   contents: write # needed to create the Release and upload its assets
 
+# The bundled actions below are JavaScript actions: GitHub runs them with a
+# Node.js runtime ON THE RUNNER (nothing to do with the app, which is a JVM
+# build that ships its own JRE). GitHub is retiring Node 20 in favour of
+# Node 24; this opts every JS action into Node 24 so the deprecation warning
+# stops, without depending on each action publishing a Node-24 release.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: ${{ matrix.name }}

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="0.55" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="node" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App background (squircle-ish) -->
+  <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232" fill="url(#bg)"/>
+
+  <!-- Phone body -->
+  <rect x="332" y="206" width="360" height="612" rx="58" ry="58" fill="#F8FAFC"/>
+  <!-- Screen -->
+  <rect x="358" y="232" width="308" height="560" rx="34" ry="34" fill="#0F172A"/>
+
+  <!-- UI element tree / exploration graph -->
+  <g stroke="#38BDF8" stroke-width="7" stroke-linecap="round" fill="none">
+    <line x1="512" y1="318" x2="446" y2="430"/>
+    <line x1="512" y1="318" x2="578" y2="430"/>
+    <line x1="446" y1="430" x2="416" y2="556"/>
+    <line x1="446" y1="430" x2="486" y2="556"/>
+    <line x1="578" y1="430" x2="558" y2="556"/>
+    <line x1="578" y1="430" x2="616" y2="556"/>
+  </g>
+
+  <!-- Tree nodes -->
+  <g fill="url(#node)" stroke="#F8FAFC" stroke-width="5">
+    <circle cx="512" cy="318" r="30"/>
+    <circle cx="446" cy="430" r="25"/>
+    <circle cx="578" cy="430" r="25"/>
+    <circle cx="416" cy="556" r="20"/>
+    <circle cx="486" cy="556" r="20"/>
+    <circle cx="558" cy="556" r="20"/>
+    <circle cx="616" cy="556" r="20"/>
+  </g>
+
+  <!-- Automation "tap" ripple on a targeted node -->
+  <g fill="none" stroke="#FACC15" stroke-width="6" opacity="0.95">
+    <circle cx="616" cy="556" r="34"/>
+    <circle cx="616" cy="556" r="50" opacity="0.6"/>
+  </g>
+  <circle cx="616" cy="556" r="11" fill="#FACC15"/>
+</svg>
